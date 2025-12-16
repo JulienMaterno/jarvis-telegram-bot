@@ -12,7 +12,7 @@ from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from fastapi import FastAPI, Request, Response
@@ -48,7 +48,7 @@ def get_drive_service():
     
     # Refresh if needed
     if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        creds.refresh(GoogleAuthRequest())
     
     return build('drive', 'v3', credentials=creds)
 
