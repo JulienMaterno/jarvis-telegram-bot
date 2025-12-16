@@ -34,8 +34,8 @@ ALLOWED_USER_IDS = [int(id.strip()) for id in os.getenv('ALLOWED_USER_IDS', '').
 # Global bot application
 bot_app = None
 
-# Google Drive setup
-SCOPES = ['https://www.googleapis.com/auth/drive.file']
+# Google Drive setup - use same scope as the token
+SCOPES = ['https://www.googleapis.com/auth/drive']
 
 
 def get_drive_service():
