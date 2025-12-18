@@ -507,6 +507,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     user_id = user.id
     
+    # Check authorization
+    if not is_authorized(user_id):
+        await update.message.reply_text("❌ You are not authorized to use this bot.")
+        return
+    
     # Check if this user is in the middle of creating a contact
     if user_id not in pending_contact_creation:
         # Not expecting a contact name, ignore or provide help
