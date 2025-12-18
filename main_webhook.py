@@ -106,7 +106,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     logger.info(f"Received voice message from {user.username} ({user.id})")
     
     # Send processing status
-    status_msg = await update.message.reply_text("⏳ Downloading voice message...")
+    status_msg = await update.message.reply_text("⏳ Processing voice message...")
     
     try:
         # Download voice file
@@ -119,9 +119,52 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"voice_{timestamp}_{user.username or user.id}.ogg"
         
-        await status_msg.edit_text("☁️ Uploading to Google Drive...")
+        # Try direct upload to audio pipeline first (faster, no Google Drive)
+        if AUDIO_PIPELINE_URL:
+            try:
+                await status_msg.edit_text("🔄 Transcribing and analyzing...")
+                
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    # Send file directly to pipeline
+                    files = {'file': (filename, file_bytes.getvalue(), 'audio/ogg')}
+                    data = {'username': user.username or str(user.id)}
+                    
+                    response = await client.post(
+                        f"{AUDIO_PIPELINE_URL}/process/upload",
+                        files=files,
+                        data=data
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        
+                        if result.get("status") == "success":
+                            summary = result.get("summary", "Processed successfully")
+                            details = result.get("details", {})
+                            
+                            await status_msg.edit_text(
+                                f"✅ *Voice memo processed!*\n\n"
+                                f"{summary}\n\n"
+                                f"📝 Transcript: {details.get('transcript_length', 0)} chars",
+                                parse_mode='Markdown'
+                            )
+                            logger.info(f"Direct processing successful: {summary}")
+                            return
+                        else:
+                            logger.warning(f"Pipeline processing failed: {result.get('error')}")
+                            # Fall through to Google Drive backup
+                    else:
+                        logger.warning(f"Pipeline returned {response.status_code}")
+                        # Fall through to Google Drive backup
+                        
+            except Exception as e:
+                logger.error(f"Direct upload failed: {e}")
+                # Fall through to Google Drive backup
         
-        # Upload to Google Drive
+        # Fallback: Upload to Google Drive for scheduler processing
+        await status_msg.edit_text("☁️ Uploading to Google Drive...")
+        file_bytes.seek(0)  # Reset stream position
+        
         drive_service = get_drive_service()
         
         file_metadata = {
@@ -144,56 +187,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.info(f"Uploaded to Drive: {uploaded_file['name']}")
         
         await status_msg.edit_text(
-            f"✅ Audio uploaded!\n\n"
+            f"✅ Audio uploaded to Drive\n\n"
             f"📁 File: `{filename}`\n\n"
-            f"🔄 Triggering processing...",
+            f"⏳ Will be processed within 15 minutes.",
             parse_mode='Markdown'
         )
-        
-        # Trigger audio pipeline processing directly
-        if AUDIO_PIPELINE_URL:
-            try:
-                async with httpx.AsyncClient(timeout=300.0) as client:
-                    response = await client.post(f"{AUDIO_PIPELINE_URL}/process/once")
-                    if response.status_code == 200:
-                        result = response.json()
-                        if result.get("processed"):
-                            await status_msg.edit_text(
-                                f"✅ Voice memo processed!\n\n"
-                                f"📁 File: `{filename}`\n\n"
-                                f"Your voice memo has been transcribed and saved.",
-                                parse_mode='Markdown'
-                            )
-                        else:
-                            await status_msg.edit_text(
-                                f"✅ Audio uploaded!\n\n"
-                                f"📁 File: `{filename}`\n\n"
-                                f"⏳ Queued for processing.",
-                                parse_mode='Markdown'
-                            )
-                    else:
-                        logger.warning(f"Pipeline returned {response.status_code}: {response.text}")
-                        await status_msg.edit_text(
-                            f"✅ Audio uploaded!\n\n"
-                            f"📁 File: `{filename}`\n\n"
-                            f"⚠️ Processing queued (pipeline busy).",
-                            parse_mode='Markdown'
-                        )
-            except Exception as e:
-                logger.error(f"Failed to trigger pipeline: {e}")
-                await status_msg.edit_text(
-                    f"✅ Audio uploaded!\n\n"
-                    f"📁 File: `{filename}`\n\n"
-                    f"⏳ Will be processed by scheduler.",
-                    parse_mode='Markdown'
-                )
-        else:
-            await status_msg.edit_text(
-                f"✅ Audio file uploaded!\n\n"
-                f"📁 File: `{filename}`\n\n"
-                f"⏳ Will be processed by scheduler.",
-                parse_mode='Markdown'
-            )
         
     except Exception as e:
         logger.error(f"Error processing voice message: {e}", exc_info=True)
@@ -211,7 +209,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     audio = update.message.audio
     logger.info(f"Received audio file from {user.username} ({user.id})")
     
-    status_msg = await update.message.reply_text("⏳ Downloading audio file...")
+    status_msg = await update.message.reply_text("⏳ Processing audio file...")
     
     try:
         file = await context.bot.get_file(audio.file_id)
@@ -221,9 +219,54 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         ext = audio.mime_type.split('/')[-1] if audio.mime_type else 'mp3'
+        mimetype = audio.mime_type or 'audio/mpeg'
         filename = f"audio_{timestamp}_{user.username or user.id}.{ext}"
         
+        # Try direct upload to audio pipeline first (faster, no Google Drive)
+        if AUDIO_PIPELINE_URL:
+            try:
+                await status_msg.edit_text("🔄 Transcribing and analyzing...")
+                
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    # Send file directly to pipeline
+                    files = {'file': (filename, file_bytes.getvalue(), mimetype)}
+                    data = {'username': user.username or str(user.id)}
+                    
+                    response = await client.post(
+                        f"{AUDIO_PIPELINE_URL}/process/upload",
+                        files=files,
+                        data=data
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        
+                        if result.get("status") == "success":
+                            summary = result.get("summary", "Processed successfully")
+                            details = result.get("details", {})
+                            
+                            await status_msg.edit_text(
+                                f"✅ *Audio processed!*\n\n"
+                                f"{summary}\n\n"
+                                f"📝 Transcript: {details.get('transcript_length', 0)} chars",
+                                parse_mode='Markdown'
+                            )
+                            logger.info(f"Direct processing successful: {summary}")
+                            return
+                        else:
+                            logger.warning(f"Pipeline processing failed: {result.get('error')}")
+                            # Fall through to Google Drive backup
+                    else:
+                        logger.warning(f"Pipeline returned {response.status_code}")
+                        # Fall through to Google Drive backup
+                        
+            except Exception as e:
+                logger.error(f"Direct upload failed: {e}")
+                # Fall through to Google Drive backup
+        
+        # Fallback: Upload to Google Drive for scheduler processing
         await status_msg.edit_text("☁️ Uploading to Google Drive...")
+        file_bytes.seek(0)  # Reset stream position
         
         drive_service = get_drive_service()
         
@@ -234,7 +277,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
         media = MediaIoBaseUpload(
             file_bytes,
-            mimetype=audio.mime_type or 'audio/mpeg',
+            mimetype=mimetype,
             resumable=True
         )
         
@@ -247,56 +290,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.info(f"Uploaded to Drive: {uploaded_file['name']}")
         
         await status_msg.edit_text(
-            f"✅ Audio uploaded!\n\n"
+            f"✅ Audio uploaded to Drive\n\n"
             f"📁 File: `{filename}`\n\n"
-            f"🔄 Triggering processing...",
+            f"⏳ Will be processed within 15 minutes.",
             parse_mode='Markdown'
         )
-        
-        # Trigger audio pipeline processing directly
-        if AUDIO_PIPELINE_URL:
-            try:
-                async with httpx.AsyncClient(timeout=300.0) as client:
-                    response = await client.post(f"{AUDIO_PIPELINE_URL}/process/once")
-                    if response.status_code == 200:
-                        result = response.json()
-                        if result.get("processed"):
-                            await status_msg.edit_text(
-                                f"✅ Audio processed!\n\n"
-                                f"📁 File: `{filename}`\n\n"
-                                f"Your audio has been transcribed and saved.",
-                                parse_mode='Markdown'
-                            )
-                        else:
-                            await status_msg.edit_text(
-                                f"✅ Audio uploaded!\n\n"
-                                f"📁 File: `{filename}`\n\n"
-                                f"⏳ Queued for processing.",
-                                parse_mode='Markdown'
-                            )
-                    else:
-                        logger.warning(f"Pipeline returned {response.status_code}: {response.text}")
-                        await status_msg.edit_text(
-                            f"✅ Audio uploaded!\n\n"
-                            f"📁 File: `{filename}`\n\n"
-                            f"⚠️ Processing queued (pipeline busy).",
-                            parse_mode='Markdown'
-                        )
-            except Exception as e:
-                logger.error(f"Failed to trigger pipeline: {e}")
-                await status_msg.edit_text(
-                    f"✅ Audio uploaded!\n\n"
-                    f"📁 File: `{filename}`\n\n"
-                    f"⏳ Will be processed by scheduler.",
-                    parse_mode='Markdown'
-                )
-        else:
-            await status_msg.edit_text(
-                f"✅ Audio file uploaded!\n\n"
-                f"📁 File: `{filename}`\n\n"
-                f"⏳ Will be processed by scheduler.",
-                parse_mode='Markdown'
-            )
         
     except Exception as e:
         logger.error(f"Error processing audio file: {e}", exc_info=True)
