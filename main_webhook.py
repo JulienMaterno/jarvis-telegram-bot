@@ -105,6 +105,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel any pending contact creation."""
+    user_id = update.effective_user.id
+    if user_id in pending_contact_creation:
+        pending_contact_creation.pop(user_id, None)
+        await update.message.reply_text("❌ Contact creation cancelled.")
+    else:
+        await update.message.reply_text("Nothing to cancel.")
+
+
 def is_authorized(user_id: int) -> bool:
     """Check if user is authorized to use the bot."""
     if not ALLOWED_USER_IDS:
@@ -372,8 +382,19 @@ def build_contact_keyboard(contact_matches: list, meeting_ids: list) -> InlineKe
             
         searched_name = match.get('searched_name', 'Unknown')
         
-        # If already matched, no buttons needed
+        # If already matched, add a "Correct" button in case it's wrong
         if match.get('matched'):
+            linked = match.get('linked_contact', {})
+            linked_name = linked.get('name', searched_name)
+            correct_key = _short_key("R")  # R = Re-link/correct
+            pending_contact_actions[correct_key] = {
+                'meeting_id': meeting_id,
+                'searched_name': searched_name,
+                'current_contact': linked_name
+            }
+            keyboard.append([
+                InlineKeyboardButton(f"✏️ Wrong? Correct '{linked_name}'", callback_data=correct_key)
+            ])
             continue
         
         suggestions = match.get('suggestions', [])
@@ -451,6 +472,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("⏭️ Skipped contact linking.")
         pending_contact_actions.pop(callback_data, None)
+    elif callback_data.startswith("R:"):
+        # Re-link/correct a wrong match
+        await handle_correct_contact(query, callback_data, action_data)
 
 
 async def handle_link_contact(query, callback_data: str, action_data: dict) -> None:
@@ -494,6 +518,41 @@ async def handle_link_contact(query, callback_data: str, action_data: dict) -> N
     finally:
         # Clean up pending action
         pending_contact_actions.pop(callback_data, None)
+
+
+async def handle_correct_contact(query, callback_data: str, action_data: dict) -> None:
+    """Handle correcting a wrongly matched contact - prompt for the right person."""
+    if not action_data:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("❌ Action expired. Please process a new audio message.")
+        return
+    
+    meeting_id = action_data['meeting_id']
+    searched_name = action_data['searched_name']
+    current_contact = action_data.get('current_contact', 'Unknown')
+    user_id = query.from_user.id
+    
+    # Store pending creation state for this user (expires in 5 minutes)
+    # mode='correct' tells the handler this is a correction, not a new contact
+    pending_contact_creation[user_id] = {
+        'meeting_id': meeting_id,
+        'suggested_name': searched_name,
+        'mode': 'correct',
+        'expires': time.time() + 300
+    }
+    
+    # Remove keyboard and ask for the correct name
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        f"✏️ *Who should this be linked to?*\n\n"
+        f"_(Currently: {current_contact})_\n\n"
+        f"Type the correct name, e.g. `Jasi Mueller`\n"
+        f"Or type `/cancel` to keep current.",
+        parse_mode='Markdown'
+    )
+    
+    # Clean up the callback action
+    pending_contact_actions.pop(callback_data, None)
 
 
 async def handle_create_contact(query, callback_data: str, action_data: dict) -> None:
@@ -558,10 +617,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Get the pending creation data
     creation_data = pending_contact_creation.pop(user_id)
     meeting_id = creation_data['meeting_id']
+    mode = creation_data.get('mode', 'create')  # 'create' or 'correct'
     typed_name = update.message.text.strip()
     
     if not typed_name:
-        await update.message.reply_text("❌ Please provide a name. Try again by tapping 'Create' on the original message.")
+        await update.message.reply_text("❌ Please provide a name. Try again by tapping the button on the original message.")
         return
     
     # Parse name into first/last
@@ -569,13 +629,57 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     first_name = name_parts[0] if name_parts else typed_name
     last_name = ' '.join(name_parts[1:]) if len(name_parts) > 1 else None
     
-    # Create the contact
     try:
         if not INTELLIGENCE_SERVICE_URL:
             await update.message.reply_text("❌ Intelligence service not configured.")
             return
             
         async with httpx.AsyncClient(timeout=30.0) as client:
+            # First, search for existing contact with this name
+            search_response = await client.get(
+                f"{INTELLIGENCE_SERVICE_URL}/api/v1/contacts/search",
+                params={"q": typed_name, "limit": 5}
+            )
+            
+            existing_contacts = []
+            if search_response.status_code == 200:
+                existing_contacts = search_response.json().get('contacts', [])
+            
+            # If we found exact or close matches, show them as options
+            if existing_contacts:
+                # Build inline keyboard with found contacts + create new option
+                keyboard = []
+                for contact in existing_contacts[:3]:
+                    contact_id = contact.get('id')
+                    name = contact.get('name', 'Unknown')
+                    company = contact.get('company', '')
+                    display = f"{name} ({company})" if company else name
+                    
+                    link_key = _short_key("L")
+                    pending_contact_actions[link_key] = {
+                        'meeting_id': meeting_id,
+                        'contact_id': contact_id,
+                        'contact_name': name,
+                        'searched_name': typed_name
+                    }
+                    keyboard.append([InlineKeyboardButton(display, callback_data=link_key)])
+                
+                # Add "Create New" option
+                create_key = _short_key("C")
+                pending_contact_actions[create_key] = {
+                    'meeting_id': meeting_id,
+                    'searched_name': typed_name
+                }
+                keyboard.append([InlineKeyboardButton(f"➕ Create new '{typed_name}'", callback_data=create_key)])
+                
+                await update.message.reply_text(
+                    f"Found existing contacts matching '*{typed_name}*':\n\nSelect one or create new:",
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+            
+            # No existing contacts found - create new one
             payload = {
                 "first_name": first_name,
                 "link_to_meeting_id": meeting_id
@@ -618,6 +722,7 @@ async def lifespan(app: FastAPI):
     # Add handlers
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("help", help_command))
+    bot_app.add_handler(CommandHandler("cancel", cancel_command))
     bot_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     bot_app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
