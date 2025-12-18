@@ -10,8 +10,8 @@ import logging
 import httpx
 from datetime import datetime
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
@@ -32,10 +32,15 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GOOGLE_DRIVE_FOLDER_ID = os.getenv('GOOGLE_DRIVE_FOLDER_ID', '').strip()
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # e.g., https://your-bot.run.app
 AUDIO_PIPELINE_URL = os.getenv('AUDIO_PIPELINE_URL', '').strip()  # e.g., https://jarvis-audio-pipeline-xxx.run.app
+INTELLIGENCE_SERVICE_URL = os.getenv('INTELLIGENCE_SERVICE_URL', '').strip()  # For contact operations
 ALLOWED_USER_IDS = [int(id.strip()) for id in os.getenv('ALLOWED_USER_IDS', '').split(',') if id.strip()]
 
 # Global bot application
 bot_app = None
+
+# Store pending contact actions (in-memory, good enough for single instance)
+# Format: { "callback_data": {"meeting_id": ..., "searched_name": ..., ...} }
+pending_contact_actions = {}
 
 # Google Drive setup - use same scope as the token
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -142,12 +147,27 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                             summary = result.get("summary", "Processed successfully")
                             details = result.get("details", {})
                             
-                            await status_msg.edit_text(
-                                f"✅ *Voice memo processed!*\n\n"
-                                f"{summary}\n\n"
-                                f"📝 Transcript: {details.get('transcript_length', 0)} chars",
-                                parse_mode='Markdown'
-                            )
+                            # Check if we need contact linking buttons
+                            contact_matches = details.get("contact_matches", [])
+                            meeting_ids = details.get("meeting_ids", [])
+                            
+                            keyboard = build_contact_keyboard(contact_matches, meeting_ids)
+                            
+                            if keyboard:
+                                await status_msg.edit_text(
+                                    f"✅ *Voice memo processed!*\n\n"
+                                    f"{summary}\n\n"
+                                    f"📝 Transcript: {details.get('transcript_length', 0)} chars",
+                                    parse_mode='Markdown',
+                                    reply_markup=keyboard
+                                )
+                            else:
+                                await status_msg.edit_text(
+                                    f"✅ *Voice memo processed!*\n\n"
+                                    f"{summary}\n\n"
+                                    f"📝 Transcript: {details.get('transcript_length', 0)} chars",
+                                    parse_mode='Markdown'
+                                )
                             logger.info(f"Direct processing successful: {summary}")
                             return
                         else:
@@ -245,12 +265,27 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                             summary = result.get("summary", "Processed successfully")
                             details = result.get("details", {})
                             
-                            await status_msg.edit_text(
-                                f"✅ *Audio processed!*\n\n"
-                                f"{summary}\n\n"
-                                f"📝 Transcript: {details.get('transcript_length', 0)} chars",
-                                parse_mode='Markdown'
-                            )
+                            # Check if we need contact linking buttons
+                            contact_matches = details.get("contact_matches", [])
+                            meeting_ids = details.get("meeting_ids", [])
+                            
+                            keyboard = build_contact_keyboard(contact_matches, meeting_ids)
+                            
+                            if keyboard:
+                                await status_msg.edit_text(
+                                    f"✅ *Audio processed!*\n\n"
+                                    f"{summary}\n\n"
+                                    f"📝 Transcript: {details.get('transcript_length', 0)} chars",
+                                    parse_mode='Markdown',
+                                    reply_markup=keyboard
+                                )
+                            else:
+                                await status_msg.edit_text(
+                                    f"✅ *Audio processed!*\n\n"
+                                    f"{summary}\n\n"
+                                    f"📝 Transcript: {details.get('transcript_length', 0)} chars",
+                                    parse_mode='Markdown'
+                                )
                             logger.info(f"Direct processing successful: {summary}")
                             return
                         else:
@@ -301,6 +336,188 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await status_msg.edit_text(f"❌ Error: {str(e)}")
 
 
+# =========================================================================
+# CONTACT LINKING HELPERS
+# =========================================================================
+
+def build_contact_keyboard(contact_matches: list, meeting_ids: list) -> InlineKeyboardMarkup | None:
+    """
+    Build inline keyboard for contact linking actions.
+    Returns None if no actions needed.
+    """
+    if not contact_matches:
+        return None
+    
+    keyboard = []
+    
+    for i, match in enumerate(contact_matches):
+        meeting_id = match.get('meeting_id') or (meeting_ids[i] if i < len(meeting_ids) else None)
+        if not meeting_id:
+            continue
+            
+        searched_name = match.get('searched_name', 'Unknown')
+        
+        # If already matched, no buttons needed
+        if match.get('matched'):
+            continue
+        
+        suggestions = match.get('suggestions', [])
+        
+        if suggestions:
+            # Add buttons for each suggestion
+            row = []
+            for suggestion in suggestions[:3]:  # Max 3 suggestions per row
+                contact_id = suggestion.get('id')
+                name = suggestion.get('name', 'Unknown')
+                # Store action data
+                callback_key = f"link:{meeting_id}:{contact_id}"
+                pending_contact_actions[callback_key] = {
+                    'meeting_id': meeting_id,
+                    'contact_id': contact_id,
+                    'contact_name': name,
+                    'searched_name': searched_name
+                }
+                row.append(InlineKeyboardButton(name, callback_data=callback_key))
+            keyboard.append(row)
+            
+            # Add "Create New" button
+            create_key = f"create:{meeting_id}:{searched_name}"
+            pending_contact_actions[create_key] = {
+                'meeting_id': meeting_id,
+                'searched_name': searched_name
+            }
+            keyboard.append([
+                InlineKeyboardButton(f"➕ Create '{searched_name}'", callback_data=create_key),
+                InlineKeyboardButton("⏭️ Skip", callback_data=f"skip:{meeting_id}")
+            ])
+        else:
+            # No suggestions - just Create or Skip
+            create_key = f"create:{meeting_id}:{searched_name}"
+            pending_contact_actions[create_key] = {
+                'meeting_id': meeting_id,
+                'searched_name': searched_name
+            }
+            keyboard.append([
+                InlineKeyboardButton(f"➕ Create '{searched_name}'", callback_data=create_key),
+                InlineKeyboardButton("⏭️ Skip", callback_data=f"skip:{meeting_id}")
+            ])
+    
+    return InlineKeyboardMarkup(keyboard) if keyboard else None
+
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard button presses."""
+    query = update.callback_query
+    await query.answer()  # Acknowledge the callback
+    
+    callback_data = query.data
+    logger.info(f"Callback received: {callback_data}")
+    
+    if callback_data.startswith("link:"):
+        # Link to existing contact
+        await handle_link_contact(query, callback_data)
+    elif callback_data.startswith("create:"):
+        # Create new contact
+        await handle_create_contact(query, callback_data)
+    elif callback_data.startswith("skip:"):
+        # Skip linking
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("⏭️ Skipped contact linking.")
+
+
+async def handle_link_contact(query, callback_data: str) -> None:
+    """Link meeting to an existing contact."""
+    action_data = pending_contact_actions.get(callback_data)
+    if not action_data:
+        await query.message.reply_text("❌ Action expired. Please try again.")
+        return
+    
+    meeting_id = action_data['meeting_id']
+    contact_id = action_data['contact_id']
+    contact_name = action_data['contact_name']
+    
+    try:
+        if not INTELLIGENCE_SERVICE_URL:
+            await query.message.reply_text("❌ Intelligence service not configured.")
+            return
+            
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.patch(
+                f"{INTELLIGENCE_SERVICE_URL}/api/v1/meetings/{meeting_id}/link-contact",
+                json={"contact_id": contact_id}
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                company = result.get('company', '')
+                if company:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                    await query.message.reply_text(f"✅ Linked to: {contact_name} ({company})")
+                else:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                    await query.message.reply_text(f"✅ Linked to: {contact_name}")
+                logger.info(f"Linked meeting {meeting_id} to contact {contact_id}")
+            else:
+                await query.message.reply_text(f"❌ Failed to link contact: {response.text}")
+                
+    except Exception as e:
+        logger.error(f"Error linking contact: {e}")
+        await query.message.reply_text(f"❌ Error: {str(e)}")
+    finally:
+        # Clean up pending action
+        pending_contact_actions.pop(callback_data, None)
+
+
+async def handle_create_contact(query, callback_data: str) -> None:
+    """Create a new contact and link to meeting."""
+    action_data = pending_contact_actions.get(callback_data)
+    if not action_data:
+        await query.message.reply_text("❌ Action expired. Please try again.")
+        return
+    
+    meeting_id = action_data['meeting_id']
+    searched_name = action_data['searched_name']
+    
+    # Parse name into first/last
+    name_parts = searched_name.strip().split()
+    first_name = name_parts[0] if name_parts else searched_name
+    last_name = ' '.join(name_parts[1:]) if len(name_parts) > 1 else None
+    
+    try:
+        if not INTELLIGENCE_SERVICE_URL:
+            await query.message.reply_text("❌ Intelligence service not configured.")
+            return
+            
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            payload = {
+                "first_name": first_name,
+                "link_to_meeting_id": meeting_id
+            }
+            if last_name:
+                payload["last_name"] = last_name
+            
+            response = await client.post(
+                f"{INTELLIGENCE_SERVICE_URL}/api/v1/contacts",
+                json=payload
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                contact_name = result.get('contact_name', searched_name)
+                await query.edit_message_reply_markup(reply_markup=None)
+                await query.message.reply_text(f"✅ Created and linked: {contact_name}")
+                logger.info(f"Created contact '{contact_name}' and linked to meeting {meeting_id}")
+            else:
+                await query.message.reply_text(f"❌ Failed to create contact: {response.text}")
+                
+    except Exception as e:
+        logger.error(f"Error creating contact: {e}")
+        await query.message.reply_text(f"❌ Error: {str(e)}")
+    finally:
+        # Clean up pending action
+        pending_contact_actions.pop(callback_data, None)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize bot application on startup."""
@@ -320,6 +537,7 @@ async def lifespan(app: FastAPI):
     bot_app.add_handler(CommandHandler("help", help_command))
     bot_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     bot_app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
+    bot_app.add_handler(CallbackQueryHandler(handle_callback_query))
     
     # Initialize bot
     await bot_app.initialize()
