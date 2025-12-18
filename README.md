@@ -1,49 +1,46 @@
-# Jarvis Telegram Bot 🤖
+# 🤖 Jarvis Telegram Bot
 
-Simple Telegram bot that receives voice messages and uploads them to Google Drive for processing by the Jarvis audio pipeline.
+> The mobile entry point. Send voice notes to Jarvis from anywhere.
 
-## Features
+## ✨ Features
 
-- 🎙️ Receive voice messages
-- 🎵 Receive audio files (mp3, m4a, etc.)
-- 📤 Upload to Google Drive automatically
-- 🔒 Optional user authorization
+*   **Voice Notes**: Forward voice messages or record them directly.
+*   **Audio Files**: Upload mp3/m4a files from your phone.
+*   **Auto-Upload**: Instantly uploads to the monitored Google Drive folder.
 
-## Setup
+## 📱 Setup
 
-1. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 1. Create a Telegram Bot
+1.  Open Telegram and search for **@BotFather**.
+2.  Send `/newbot` and follow instructions.
+3.  Copy the **API Token**.
 
-2. **Configure environment:**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your tokens
-   ```
+### 2. Configuration
 
-3. **Copy Google credentials:**
-   ```bash
-   mkdir data
-   cp ../jarvis-audio-pipeline/data/token.json data/
-   ```
+Create a `.env` file:
 
-4. **Run:**
-   ```bash
-   python main.py
-   ```
+```ini
+TELEGRAM_BOT_TOKEN=your_bot_token
+GOOGLE_DRIVE_FOLDER_ID=same_folder_id_as_audio_pipeline
+ALLOWED_USER_IDS=123456789,987654321
+```
 
-## Usage
+*   `ALLOWED_USER_IDS`: Comma-separated list of Telegram User IDs allowed to use the bot (security). You can find your ID using @userinfobot.
 
-1. Open Telegram and find your bot (@NewWorldJarvisBot)
-2. Send a voice message
-3. Bot uploads to Google Drive
-4. jarvis-audio-pipeline processes it automatically
+### 3. Run the Bot
 
-## Environment Variables
+```bash
+# Install dependencies
+pip install -r requirements.txt
 
-| Variable | Description |
-|----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | From @BotFather |
-| `GOOGLE_DRIVE_FOLDER_ID` | Target folder for uploads |
-| `ALLOWED_USER_IDS` | Comma-separated Telegram user IDs (optional) |
+# Run
+python main.py
+```
+
+## 🚀 Usage
+
+1.  Start a chat with your bot.
+2.  Hold the microphone button and record a thought.
+3.  The bot will reply: "✅ Voice note uploaded to Drive".
+4.  The **Audio Pipeline** will pick it up, transcribe it, and the **Intelligence Service** will analyze it.
+5.  Check your Notion "Reflections" or "Tasks" database a few minutes later!
