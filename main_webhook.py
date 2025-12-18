@@ -42,6 +42,10 @@ bot_app = None
 # Format: { "callback_data": {"meeting_id": ..., "searched_name": ..., ...} }
 pending_contact_actions = {}
 
+# Store users waiting to type a contact name
+# Format: { user_id: {"meeting_id": ..., "suggested_name": ...} }
+pending_contact_creation = {}
+
 # Google Drive setup - use same scope as the token
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
@@ -469,7 +473,7 @@ async def handle_link_contact(query, callback_data: str) -> None:
 
 
 async def handle_create_contact(query, callback_data: str) -> None:
-    """Create a new contact and link to meeting."""
+    """Prompt user to type the correct name for a new contact."""
     action_data = pending_contact_actions.get(callback_data)
     if not action_data:
         await query.message.reply_text("❌ Action expired. Please try again.")
@@ -477,15 +481,59 @@ async def handle_create_contact(query, callback_data: str) -> None:
     
     meeting_id = action_data['meeting_id']
     searched_name = action_data['searched_name']
+    user_id = query.from_user.id
+    
+    # Store pending creation state for this user
+    pending_contact_creation[user_id] = {
+        'meeting_id': meeting_id,
+        'suggested_name': searched_name
+    }
+    
+    # Remove keyboard and ask for the name
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        f"✏️ *Type the correct name* for this contact:\n\n"
+        f"_(Detected: {searched_name})_\n\n"
+        f"Just send the name, e.g. `Jasi Mueller`",
+        parse_mode='Markdown'
+    )
+    
+    # Clean up the callback action
+    pending_contact_actions.pop(callback_data, None)
+
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text messages - used for typing contact names."""
+    user = update.effective_user
+    user_id = user.id
+    
+    # Check if this user is in the middle of creating a contact
+    if user_id not in pending_contact_creation:
+        # Not expecting a contact name, ignore or provide help
+        await update.message.reply_text(
+            "👋 Send me a voice message or audio file to process!\n\n"
+            "Type /help for more info."
+        )
+        return
+    
+    # Get the pending creation data
+    creation_data = pending_contact_creation.pop(user_id)
+    meeting_id = creation_data['meeting_id']
+    typed_name = update.message.text.strip()
+    
+    if not typed_name:
+        await update.message.reply_text("❌ Please provide a name. Try again by tapping 'Create' on the original message.")
+        return
     
     # Parse name into first/last
-    name_parts = searched_name.strip().split()
-    first_name = name_parts[0] if name_parts else searched_name
+    name_parts = typed_name.split()
+    first_name = name_parts[0] if name_parts else typed_name
     last_name = ' '.join(name_parts[1:]) if len(name_parts) > 1 else None
     
+    # Create the contact
     try:
         if not INTELLIGENCE_SERVICE_URL:
-            await query.message.reply_text("❌ Intelligence service not configured.")
+            await update.message.reply_text("❌ Intelligence service not configured.")
             return
             
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -503,19 +551,15 @@ async def handle_create_contact(query, callback_data: str) -> None:
             
             if response.status_code == 200:
                 result = response.json()
-                contact_name = result.get('contact_name', searched_name)
-                await query.edit_message_reply_markup(reply_markup=None)
-                await query.message.reply_text(f"✅ Created and linked: {contact_name}")
+                contact_name = result.get('contact_name', typed_name)
+                await update.message.reply_text(f"✅ Created and linked: *{contact_name}*", parse_mode='Markdown')
                 logger.info(f"Created contact '{contact_name}' and linked to meeting {meeting_id}")
             else:
-                await query.message.reply_text(f"❌ Failed to create contact: {response.text}")
+                await update.message.reply_text(f"❌ Failed to create contact: {response.text}")
                 
     except Exception as e:
         logger.error(f"Error creating contact: {e}")
-        await query.message.reply_text(f"❌ Error: {str(e)}")
-    finally:
-        # Clean up pending action
-        pending_contact_actions.pop(callback_data, None)
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
 
 @asynccontextmanager
@@ -537,6 +581,7 @@ async def lifespan(app: FastAPI):
     bot_app.add_handler(CommandHandler("help", help_command))
     bot_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     bot_app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     bot_app.add_handler(CallbackQueryHandler(handle_callback_query))
     
     # Initialize bot
