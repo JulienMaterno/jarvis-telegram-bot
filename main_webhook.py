@@ -8,6 +8,8 @@ import io
 import json
 import logging
 import httpx
+import hashlib
+import time
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -39,12 +41,21 @@ ALLOWED_USER_IDS = [int(id.strip()) for id in os.getenv('ALLOWED_USER_IDS', '').
 bot_app = None
 
 # Store pending contact actions (in-memory, good enough for single instance)
-# Format: { "callback_data": {"meeting_id": ..., "searched_name": ..., ...} }
+# Format: { "short_key": {"meeting_id": ..., "searched_name": ..., ...} }
 pending_contact_actions = {}
 
 # Store users waiting to type a contact name
-# Format: { user_id: {"meeting_id": ..., "suggested_name": ...} }
+# Format: { user_id: {\"meeting_id\": ..., \"suggested_name\": ..., \"expires\": timestamp} }
 pending_contact_creation = {}
+
+# Counter for generating short callback keys (avoids 64-byte Telegram limit)
+_callback_counter = 0
+
+def _short_key(prefix: str) -> str:
+    """Generate a short unique callback key to stay under Telegram's 64-byte limit."""
+    global _callback_counter
+    _callback_counter += 1
+    return f"{prefix}:{_callback_counter}"
 
 # Google Drive setup - use same scope as the token
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -373,8 +384,8 @@ def build_contact_keyboard(contact_matches: list, meeting_ids: list) -> InlineKe
             for suggestion in suggestions[:3]:  # Max 3 suggestions per row
                 contact_id = suggestion.get('id')
                 name = suggestion.get('name', 'Unknown')
-                # Store action data
-                callback_key = f"link:{meeting_id}:{contact_id}"
+                # Use short key to avoid 64-byte Telegram limit
+                callback_key = _short_key("L")
                 pending_contact_actions[callback_key] = {
                     'meeting_id': meeting_id,
                     'contact_id': contact_id,
@@ -384,26 +395,35 @@ def build_contact_keyboard(contact_matches: list, meeting_ids: list) -> InlineKe
                 row.append(InlineKeyboardButton(name, callback_data=callback_key))
             keyboard.append(row)
             
-            # Add "Create New" button
-            create_key = f"create:{meeting_id}:{searched_name}"
+            # Add "Create New" and "Skip" buttons
+            create_key = _short_key("C")
+            skip_key = _short_key("S")
             pending_contact_actions[create_key] = {
                 'meeting_id': meeting_id,
                 'searched_name': searched_name
             }
+            pending_contact_actions[skip_key] = {'meeting_id': meeting_id}
+            
+            # Truncate display name if too long
+            display_name = searched_name[:15] + "..." if len(searched_name) > 15 else searched_name
             keyboard.append([
-                InlineKeyboardButton(f"➕ Create '{searched_name}'", callback_data=create_key),
-                InlineKeyboardButton("⏭️ Skip", callback_data=f"skip:{meeting_id}")
+                InlineKeyboardButton(f"➕ Create '{display_name}'", callback_data=create_key),
+                InlineKeyboardButton("⏭️ Skip", callback_data=skip_key)
             ])
         else:
             # No suggestions - just Create or Skip
-            create_key = f"create:{meeting_id}:{searched_name}"
+            create_key = _short_key("C")
+            skip_key = _short_key("S")
             pending_contact_actions[create_key] = {
                 'meeting_id': meeting_id,
                 'searched_name': searched_name
             }
+            pending_contact_actions[skip_key] = {'meeting_id': meeting_id}
+            
+            display_name = searched_name[:15] + "..." if len(searched_name) > 15 else searched_name
             keyboard.append([
-                InlineKeyboardButton(f"➕ Create '{searched_name}'", callback_data=create_key),
-                InlineKeyboardButton("⏭️ Skip", callback_data=f"skip:{meeting_id}")
+                InlineKeyboardButton(f"➕ Create '{display_name}'", callback_data=create_key),
+                InlineKeyboardButton("⏭️ Skip", callback_data=skip_key)
             ])
     
     return InlineKeyboardMarkup(keyboard) if keyboard else None
@@ -417,23 +437,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     callback_data = query.data
     logger.info(f"Callback received: {callback_data}")
     
-    if callback_data.startswith("link:"):
+    # Check if action exists in pending (short keys: L=link, C=create, S=skip)
+    action_data = pending_contact_actions.get(callback_data)
+    
+    if callback_data.startswith("L:"):
         # Link to existing contact
-        await handle_link_contact(query, callback_data)
-    elif callback_data.startswith("create:"):
+        await handle_link_contact(query, callback_data, action_data)
+    elif callback_data.startswith("C:"):
         # Create new contact
-        await handle_create_contact(query, callback_data)
-    elif callback_data.startswith("skip:"):
+        await handle_create_contact(query, callback_data, action_data)
+    elif callback_data.startswith("S:"):
         # Skip linking
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("⏭️ Skipped contact linking.")
+        pending_contact_actions.pop(callback_data, None)
 
 
-async def handle_link_contact(query, callback_data: str) -> None:
+async def handle_link_contact(query, callback_data: str, action_data: dict) -> None:
     """Link meeting to an existing contact."""
-    action_data = pending_contact_actions.get(callback_data)
     if not action_data:
-        await query.message.reply_text("❌ Action expired. Please try again.")
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("❌ Action expired. Please process a new audio message.")
         return
     
     meeting_id = action_data['meeting_id']
@@ -472,21 +496,22 @@ async def handle_link_contact(query, callback_data: str) -> None:
         pending_contact_actions.pop(callback_data, None)
 
 
-async def handle_create_contact(query, callback_data: str) -> None:
+async def handle_create_contact(query, callback_data: str, action_data: dict) -> None:
     """Prompt user to type the correct name for a new contact."""
-    action_data = pending_contact_actions.get(callback_data)
     if not action_data:
-        await query.message.reply_text("❌ Action expired. Please try again.")
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("❌ Action expired. Please process a new audio message.")
         return
     
     meeting_id = action_data['meeting_id']
     searched_name = action_data['searched_name']
     user_id = query.from_user.id
     
-    # Store pending creation state for this user
+    # Store pending creation state for this user (expires in 5 minutes)
     pending_contact_creation[user_id] = {
         'meeting_id': meeting_id,
-        'suggested_name': searched_name
+        'suggested_name': searched_name,
+        'expires': time.time() + 300  # 5 minute timeout
     }
     
     # Remove keyboard and ask for the name
@@ -518,6 +543,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(
             "👋 Send me a voice message or audio file to process!\n\n"
             "Type /help for more info."
+        )
+        return
+    
+    # Check if the pending action has expired
+    creation_data = pending_contact_creation.get(user_id)
+    if creation_data.get('expires', 0) < time.time():
+        pending_contact_creation.pop(user_id, None)
+        await update.message.reply_text(
+            "⏰ Contact creation timed out. Please process a new audio message."
         )
         return
     
