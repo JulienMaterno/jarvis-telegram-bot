@@ -15,7 +15,8 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, HTTPException
+from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
 # Configure logging
@@ -277,6 +278,31 @@ async def webhook(request: Request):
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)
         return Response(status_code=500)
+
+
+class MessageRequest(BaseModel):
+    chat_id: int
+    text: str
+    parse_mode: str = None
+
+@app.post("/send_message")
+async def send_message_endpoint(msg: MessageRequest):
+    """Internal endpoint to send messages via the bot."""
+    global bot_app
+    
+    if not bot_app:
+        raise HTTPException(status_code=500, detail="Bot not initialized")
+        
+    try:
+        await bot_app.bot.send_message(
+            chat_id=msg.chat_id,
+            text=msg.text,
+            parse_mode=msg.parse_mode
+        )
+        return {"status": "sent"}
+    except Exception as e:
+        logger.error(f"Failed to send message: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
