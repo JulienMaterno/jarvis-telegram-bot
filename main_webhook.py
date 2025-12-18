@@ -7,6 +7,7 @@ import os
 import io
 import json
 import logging
+import httpx
 from datetime import datetime
 
 from telegram import Update
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GOOGLE_DRIVE_FOLDER_ID = os.getenv('GOOGLE_DRIVE_FOLDER_ID', '').strip()
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # e.g., https://your-bot.run.app
+AUDIO_PIPELINE_URL = os.getenv('AUDIO_PIPELINE_URL', '').strip()  # e.g., https://jarvis-audio-pipeline-xxx.run.app
 ALLOWED_USER_IDS = [int(id.strip()) for id in os.getenv('ALLOWED_USER_IDS', '').split(',') if id.strip()]
 
 # Global bot application
@@ -142,11 +144,56 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.info(f"Uploaded to Drive: {uploaded_file['name']}")
         
         await status_msg.edit_text(
-            f"✅ Audio file uploaded!\n\n"
+            f"✅ Audio uploaded!\n\n"
             f"📁 File: `{filename}`\n\n"
-            f"Processing will begin automatically via webhook.",
+            f"🔄 Triggering processing...",
             parse_mode='Markdown'
         )
+        
+        # Trigger audio pipeline processing directly
+        if AUDIO_PIPELINE_URL:
+            try:
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    response = await client.post(f"{AUDIO_PIPELINE_URL}/process/once")
+                    if response.status_code == 200:
+                        result = response.json()
+                        if result.get("processed"):
+                            await status_msg.edit_text(
+                                f"✅ Voice memo processed!\n\n"
+                                f"📁 File: `{filename}`\n\n"
+                                f"Your voice memo has been transcribed and saved.",
+                                parse_mode='Markdown'
+                            )
+                        else:
+                            await status_msg.edit_text(
+                                f"✅ Audio uploaded!\n\n"
+                                f"📁 File: `{filename}`\n\n"
+                                f"⏳ Queued for processing.",
+                                parse_mode='Markdown'
+                            )
+                    else:
+                        logger.warning(f"Pipeline returned {response.status_code}: {response.text}")
+                        await status_msg.edit_text(
+                            f"✅ Audio uploaded!\n\n"
+                            f"📁 File: `{filename}`\n\n"
+                            f"⚠️ Processing queued (pipeline busy).",
+                            parse_mode='Markdown'
+                        )
+            except Exception as e:
+                logger.error(f"Failed to trigger pipeline: {e}")
+                await status_msg.edit_text(
+                    f"✅ Audio uploaded!\n\n"
+                    f"📁 File: `{filename}`\n\n"
+                    f"⏳ Will be processed by scheduler.",
+                    parse_mode='Markdown'
+                )
+        else:
+            await status_msg.edit_text(
+                f"✅ Audio file uploaded!\n\n"
+                f"📁 File: `{filename}`\n\n"
+                f"⏳ Will be processed by scheduler.",
+                parse_mode='Markdown'
+            )
         
     except Exception as e:
         logger.error(f"Error processing voice message: {e}", exc_info=True)
@@ -200,11 +247,56 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.info(f"Uploaded to Drive: {uploaded_file['name']}")
         
         await status_msg.edit_text(
-            f"✅ Audio file uploaded!\n\n"
+            f"✅ Audio uploaded!\n\n"
             f"📁 File: `{filename}`\n\n"
-            f"Processing will begin automatically via webhook.",
+            f"🔄 Triggering processing...",
             parse_mode='Markdown'
         )
+        
+        # Trigger audio pipeline processing directly
+        if AUDIO_PIPELINE_URL:
+            try:
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    response = await client.post(f"{AUDIO_PIPELINE_URL}/process/once")
+                    if response.status_code == 200:
+                        result = response.json()
+                        if result.get("processed"):
+                            await status_msg.edit_text(
+                                f"✅ Audio processed!\n\n"
+                                f"📁 File: `{filename}`\n\n"
+                                f"Your audio has been transcribed and saved.",
+                                parse_mode='Markdown'
+                            )
+                        else:
+                            await status_msg.edit_text(
+                                f"✅ Audio uploaded!\n\n"
+                                f"📁 File: `{filename}`\n\n"
+                                f"⏳ Queued for processing.",
+                                parse_mode='Markdown'
+                            )
+                    else:
+                        logger.warning(f"Pipeline returned {response.status_code}: {response.text}")
+                        await status_msg.edit_text(
+                            f"✅ Audio uploaded!\n\n"
+                            f"📁 File: `{filename}`\n\n"
+                            f"⚠️ Processing queued (pipeline busy).",
+                            parse_mode='Markdown'
+                        )
+            except Exception as e:
+                logger.error(f"Failed to trigger pipeline: {e}")
+                await status_msg.edit_text(
+                    f"✅ Audio uploaded!\n\n"
+                    f"📁 File: `{filename}`\n\n"
+                    f"⏳ Will be processed by scheduler.",
+                    parse_mode='Markdown'
+                )
+        else:
+            await status_msg.edit_text(
+                f"✅ Audio file uploaded!\n\n"
+                f"📁 File: `{filename}`\n\n"
+                f"⏳ Will be processed by scheduler.",
+                parse_mode='Markdown'
+            )
         
     except Exception as e:
         logger.error(f"Error processing audio file: {e}", exc_info=True)
