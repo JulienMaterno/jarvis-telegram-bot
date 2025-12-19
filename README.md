@@ -1,6 +1,21 @@
-# 🤖 Jarvis Telegram Bot
+# 📱 Jarvis Telegram Bot
 
-> The mobile entry point. Send voice notes to Jarvis from anywhere.
+> **User interface for Jarvis.** Send voice notes, chat with AI, and receive notifications - all via Telegram.
+
+## 🎯 Role in the Ecosystem
+
+This bot is the **mobile entry point** to Jarvis. It does two things:
+
+1. **Input**: Voice notes → Google Drive (triggers Audio Pipeline) → Intelligence Service
+2. **Chat**: Text messages → Intelligence Service → AI Response
+3. **Notifications**: Receives alerts from other services (errors, confirmations)
+
+```
+User Input → Telegram Bot → Intelligence Service (AI) → Response
+                         → Google Drive → Audio Pipeline → Intelligence Service
+```
+
+**Why no AI here?** All intelligence lives in the Intelligence Service. This bot is just the interface.
 
 ## ✨ Features
 
