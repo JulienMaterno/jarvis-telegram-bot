@@ -48,6 +48,10 @@ pending_contact_actions = {}
 # Format: { user_id: {\"meeting_id\": ..., \"suggested_name\": ..., \"expires\": timestamp} }
 pending_contact_creation = {}
 
+# Track recently processed file IDs to prevent duplicates (TTL ~5 minutes)
+# Format: { file_unique_id: timestamp }
+recently_processed_files = {}
+
 # Counter for generating short callback keys (avoids 64-byte Telegram limit)
 _callback_counter = 0
 
@@ -56,6 +60,25 @@ def _short_key(prefix: str) -> str:
     global _callback_counter
     _callback_counter += 1
     return f"{prefix}:{_callback_counter}"
+
+
+def _is_duplicate_file(file_unique_id: str) -> bool:
+    """Check if file was recently processed (deduplication)."""
+    import time
+    now = time.time()
+    
+    # Clean up old entries (older than 5 minutes)
+    expired = [k for k, v in recently_processed_files.items() if now - v > 300]
+    for k in expired:
+        recently_processed_files.pop(k, None)
+    
+    # Check if already processed
+    if file_unique_id in recently_processed_files:
+        return True
+    
+    # Mark as processed
+    recently_processed_files[file_unique_id] = now
+    return False
 
 # Google Drive setup - use same scope as the token
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -133,6 +156,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     
     voice = update.message.voice
+    
+    # Check for duplicate processing (Telegram sometimes resends)
+    if _is_duplicate_file(voice.file_unique_id):
+        logger.warning(f"Duplicate voice message detected, skipping: {voice.file_unique_id}")
+        return
+    
     logger.info(f"Received voice message from {user.username} ({user.id})")
     
     # Send processing status
@@ -252,6 +281,12 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     
     audio = update.message.audio
+    
+    # Check for duplicate processing
+    if _is_duplicate_file(audio.file_unique_id):
+        logger.warning(f"Duplicate audio file detected, skipping: {audio.file_unique_id}")
+        return
+    
     logger.info(f"Received audio file from {user.username} ({user.id})")
     
     status_msg = await update.message.reply_text("⏳ Processing audio file...")
@@ -798,6 +833,19 @@ async def send_message_endpoint(msg: MessageRequest):
         )
         return {"status": "sent"}
     except Exception as e:
+        # If Markdown parsing fails, retry without parse_mode
+        if "parse entities" in str(e).lower():
+            logger.warning(f"Markdown parse failed, retrying without formatting: {e}")
+            try:
+                await bot_app.bot.send_message(
+                    chat_id=msg.chat_id,
+                    text=msg.text,
+                    parse_mode=None
+                )
+                return {"status": "sent", "note": "sent_without_formatting"}
+            except Exception as e2:
+                logger.error(f"Failed to send message even without formatting: {e2}")
+                raise HTTPException(status_code=500, detail=str(e2))
         logger.error(f"Failed to send message: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
