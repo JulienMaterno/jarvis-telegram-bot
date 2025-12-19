@@ -44,8 +44,8 @@ bot_app = None
 # Format: { "short_key": {"meeting_id": ..., "searched_name": ..., ...} }
 pending_contact_actions = {}
 
-# Store users waiting to type a contact name
-# Format: { user_id: {\"meeting_id\": ..., \"suggested_name\": ..., \"expires\": timestamp} }
+# Store users waiting to type a contact name or selection
+# Format: { user_id: {"meeting_id": ..., "searched_name": ..., "mode": ..., "suggestions": [...], "expires": timestamp} }
 pending_contact_creation = {}
 
 # Track recently processed file IDs to prevent duplicates (TTL ~5 minutes)
@@ -201,27 +201,27 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                             summary = result.get("summary", "Processed successfully")
                             details = result.get("details", {})
                             
-                            # Check if we need contact linking buttons
+                            # Check if we need contact linking
                             contact_matches = details.get("contact_matches", [])
                             meeting_ids = details.get("meeting_ids", [])
                             
-                            keyboard = build_contact_keyboard(contact_matches, meeting_ids)
+                            # Build text-based contact prompt (works in Beeper/bridges)
+                            contact_prompt = build_contact_text_prompt(
+                                contact_matches, meeting_ids, user.id
+                            )
                             
-                            if keyboard:
-                                await status_msg.edit_text(
-                                    f"✅ *Voice memo processed!*\n\n"
-                                    f"{summary}\n\n"
-                                    f"📝 Transcript: {details.get('transcript_length', 0)} chars",
-                                    parse_mode='Markdown',
-                                    reply_markup=keyboard
-                                )
-                            else:
-                                await status_msg.edit_text(
-                                    f"✅ *Voice memo processed!*\n\n"
-                                    f"{summary}\n\n"
-                                    f"📝 Transcript: {details.get('transcript_length', 0)} chars",
-                                    parse_mode='Markdown'
-                                )
+                            # Send main result
+                            await status_msg.edit_text(
+                                f"✅ *Voice memo processed!*\n\n"
+                                f"{summary}\n\n"
+                                f"📝 Transcript: {details.get('transcript_length', 0)} chars",
+                                parse_mode='Markdown'
+                            )
+                            
+                            # Send contact prompt separately if needed
+                            if contact_prompt:
+                                await update.message.reply_text(contact_prompt)
+                            
                             logger.info(f"Direct processing successful: {summary}")
                             return
                         else:
@@ -397,8 +397,76 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # =========================================================================
-# CONTACT LINKING HELPERS
+# CONTACT LINKING HELPERS (Text-based for Beeper/bridge compatibility)
 # =========================================================================
+
+def build_contact_text_prompt(contact_matches: list, meeting_ids: list, user_id: int) -> str | None:
+    """
+    Build a text-based prompt for contact linking (works in Beeper/bridges).
+    Stores pending action in pending_contact_creation for the user.
+    Returns the prompt text or None if no action needed.
+    """
+    if not contact_matches:
+        return None
+    
+    prompts = []
+    
+    for i, match in enumerate(contact_matches):
+        meeting_id = match.get('meeting_id') or (meeting_ids[i] if i < len(meeting_ids) else None)
+        if not meeting_id:
+            continue
+            
+        searched_name = match.get('searched_name', 'Unknown')
+        
+        # Skip if already matched with high confidence
+        if match.get('matched'):
+            linked = match.get('linked_contact', {})
+            linked_name = linked.get('name', searched_name)
+            company = linked.get('company', '')
+            if company:
+                prompts.append(f"👤 Linked to: {linked_name} ({company})")
+            else:
+                prompts.append(f"👤 Linked to: {linked_name}")
+            continue
+        
+        suggestions = match.get('suggestions', [])
+        
+        # Store pending action for this user
+        pending_contact_creation[user_id] = {
+            'meeting_id': meeting_id,
+            'searched_name': searched_name,
+            'suggestions': suggestions,
+            'mode': 'link_or_create',
+            'expires': time.time() + 600  # 10 minutes
+        }
+        
+        if suggestions:
+            # Build numbered list of suggestions
+            prompt_lines = [f"❓ Unknown contact: *{searched_name}*", ""]
+            prompt_lines.append("Reply with:")
+            for j, suggestion in enumerate(suggestions[:5], 1):
+                name = suggestion.get('name', 'Unknown')
+                company = suggestion.get('company', '')
+                if company:
+                    prompt_lines.append(f"  {j} = {name} ({company})")
+                else:
+                    prompt_lines.append(f"  {j} = {name}")
+            prompt_lines.append(f"  0 = Skip")
+            prompt_lines.append(f"  Or type the correct full name")
+            prompts.append("\n".join(prompt_lines))
+        else:
+            # No suggestions - ask for the name
+            prompt_lines = [
+                f"❓ Unknown contact: *{searched_name}*",
+                "",
+                "Reply with:",
+                "  The correct full name (e.g. 'John Smith')",
+                "  Or '0' to skip"
+            ]
+            prompts.append("\n".join(prompt_lines))
+    
+    return "\n\n".join(prompts) if prompts else None
+
 
 def build_contact_keyboard(contact_matches: list, meeting_ids: list) -> InlineKeyboardMarkup | None:
     """
@@ -622,7 +690,7 @@ async def handle_create_contact(query, callback_data: str, action_data: dict) ->
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages - used for typing contact names."""
+    """Handle text messages - used for typing contact names or selections."""
     user = update.effective_user
     user_id = user.id
     
@@ -631,9 +699,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ You are not authorized to use this bot.")
         return
     
-    # Check if this user is in the middle of creating a contact
+    # Check if this user is in the middle of contact linking
     if user_id not in pending_contact_creation:
-        # Not expecting a contact name, ignore or provide help
+        # Not expecting input, provide help
         await update.message.reply_text(
             "👋 Send me a voice message or audio file to process!\n\n"
             "Type /help for more info."
@@ -645,18 +713,64 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if creation_data.get('expires', 0) < time.time():
         pending_contact_creation.pop(user_id, None)
         await update.message.reply_text(
-            "⏰ Contact creation timed out. Please process a new audio message."
+            "⏰ Action timed out. Please process a new audio message."
         )
         return
     
     # Get the pending creation data
-    creation_data = pending_contact_creation.pop(user_id)
     meeting_id = creation_data['meeting_id']
-    mode = creation_data.get('mode', 'create')  # 'create' or 'correct'
-    typed_name = update.message.text.strip()
+    searched_name = creation_data.get('searched_name', 'Unknown')
+    suggestions = creation_data.get('suggestions', [])
+    typed_text = update.message.text.strip()
     
-    if not typed_name:
-        await update.message.reply_text("❌ Please provide a name. Try again by tapping the button on the original message.")
+    # Handle '0' = skip
+    if typed_text == '0':
+        pending_contact_creation.pop(user_id, None)
+        await update.message.reply_text("⏭️ Skipped contact linking.")
+        return
+    
+    # Handle numeric selection (1, 2, 3, etc.)
+    if typed_text.isdigit() and suggestions:
+        selection = int(typed_text)
+        if 1 <= selection <= len(suggestions):
+            # Link to selected suggestion
+            selected = suggestions[selection - 1]
+            contact_id = selected.get('id')
+            contact_name = selected.get('name', 'Unknown')
+            
+            pending_contact_creation.pop(user_id, None)
+            
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.patch(
+                        f"{INTELLIGENCE_SERVICE_URL}/api/v1/meetings/{meeting_id}/link-contact",
+                        json={"contact_id": contact_id}
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        company = result.get('company', '')
+                        if company:
+                            await update.message.reply_text(f"✅ Linked to: {contact_name} ({company})")
+                        else:
+                            await update.message.reply_text(f"✅ Linked to: {contact_name}")
+                        logger.info(f"Linked meeting {meeting_id} to contact {contact_id}")
+                    else:
+                        await update.message.reply_text(f"❌ Failed to link: {response.text}")
+            except Exception as e:
+                logger.error(f"Error linking contact: {e}")
+                await update.message.reply_text(f"❌ Error: {str(e)}")
+            return
+        else:
+            await update.message.reply_text(f"❌ Invalid selection. Reply 1-{len(suggestions)} or type a name.")
+            return
+    
+    # User typed a name - search or create
+    pending_contact_creation.pop(user_id, None)
+    typed_name = typed_text
+    
+    if not typed_name or len(typed_name) < 2:
+        await update.message.reply_text("❌ Please provide a valid name (at least 2 characters).")
         return
     
     # Parse name into first/last
@@ -680,38 +794,28 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if search_response.status_code == 200:
                 existing_contacts = search_response.json().get('contacts', [])
             
-            # If we found exact or close matches, show them as options
+            # If we found matches, store and ask user to select
             if existing_contacts:
-                # Build inline keyboard with found contacts + create new option
-                keyboard = []
-                for contact in existing_contacts[:3]:
-                    contact_id = contact.get('id')
+                # Store new pending with these suggestions
+                pending_contact_creation[user_id] = {
+                    'meeting_id': meeting_id,
+                    'searched_name': typed_name,
+                    'suggestions': existing_contacts,
+                    'mode': 'select_or_create',
+                    'expires': time.time() + 300
+                }
+                
+                prompt_lines = [f"Found existing contacts matching '{typed_name}':", ""]
+                for j, contact in enumerate(existing_contacts[:5], 1):
                     name = contact.get('name', 'Unknown')
                     company = contact.get('company', '')
-                    display = f"{name} ({company})" if company else name
-                    
-                    link_key = _short_key("L")
-                    pending_contact_actions[link_key] = {
-                        'meeting_id': meeting_id,
-                        'contact_id': contact_id,
-                        'contact_name': name,
-                        'searched_name': typed_name
-                    }
-                    keyboard.append([InlineKeyboardButton(display, callback_data=link_key)])
+                    if company:
+                        prompt_lines.append(f"  {j} = {name} ({company})")
+                    else:
+                        prompt_lines.append(f"  {j} = {name}")
+                prompt_lines.append(f"  0 = Create new '{typed_name}'")
                 
-                # Add "Create New" option
-                create_key = _short_key("C")
-                pending_contact_actions[create_key] = {
-                    'meeting_id': meeting_id,
-                    'searched_name': typed_name
-                }
-                keyboard.append([InlineKeyboardButton(f"➕ Create new '{typed_name}'", callback_data=create_key)])
-                
-                await update.message.reply_text(
-                    f"Found existing contacts matching '*{typed_name}*':\n\nSelect one or create new:",
-                    parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
+                await update.message.reply_text("\n".join(prompt_lines))
                 return
             
             # No existing contacts found - create new one
@@ -730,13 +834,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if response.status_code == 200:
                 result = response.json()
                 contact_name = result.get('contact_name', typed_name)
-                await update.message.reply_text(f"✅ Created and linked: *{contact_name}*", parse_mode='Markdown')
+                await update.message.reply_text(f"✅ Created and linked: {contact_name}")
                 logger.info(f"Created contact '{contact_name}' and linked to meeting {meeting_id}")
             else:
                 await update.message.reply_text(f"❌ Failed to create contact: {response.text}")
                 
     except Exception as e:
-        logger.error(f"Error creating contact: {e}")
+        logger.error(f"Error handling contact: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 
