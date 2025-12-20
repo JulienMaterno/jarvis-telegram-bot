@@ -42,15 +42,18 @@ ALLOWED_USER_IDS=123456789,987654321
 
 *   `ALLOWED_USER_IDS`: Comma-separated list of Telegram User IDs allowed to use the bot (security). You can find your ID using @userinfobot.
 
-### 3. Run the Bot
+### 3. Deployment (CI/CD)
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
+This service is automatically deployed to **Google Cloud Run** via **Google Cloud Build** whenever code is pushed to the `main` branch.
 
-# Run
-python main.py
-```
+*   **Trigger**: Push to `main`
+*   **Build Config**: `cloudbuild.yaml`
+*   **Mode**: Runs in Webhook mode (FastAPI) on Cloud Run.
+*   **Environment Variables**:
+    *   `WEBHOOK_URL`: The public URL of this Cloud Run service
+    *   `AUDIO_PIPELINE_URL`: URL of the Audio Pipeline
+    *   `INTELLIGENCE_SERVICE_URL`: URL of the Intelligence Service
+*   **Secrets**: Managed via Google Secret Manager (`TELEGRAM_BOT_TOKEN`, `GOOGLE_TOKEN_JSON`)
 
 ## 🚀 Usage
 
