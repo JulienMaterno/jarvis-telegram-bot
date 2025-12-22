@@ -167,8 +167,17 @@ def _is_duplicate_file(file_unique_id: str) -> bool:
 
 ## 🚀 Deployment
 
-### Automatic (Production)
-Push to `main` → Cloud Build → Cloud Run
+### Automatic via GitHub (Production)
+Push to `main` → Cloud Build → Cloud Run (automatic)
+
+```bash
+git push origin main
+```
+
+Cloud Build triggers:
+- **Trigger**: `jarvis-telegram-bot-deploy`
+- **Branch**: `^main$`
+- **Config**: `cloudbuild.yaml`
 
 ### Manual (Development)
 ```bash
