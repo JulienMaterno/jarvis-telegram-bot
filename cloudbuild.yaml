@@ -26,5 +26,8 @@ steps:
       - '--set-secrets'
       - 'TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,GOOGLE_TOKEN_JSON=GOOGLE_TOKEN_JSON:latest,GOOGLE_DRIVE_FOLDER_ID=GOOGLE_DRIVE_FOLDER_ID:latest'
 
+options:
+  logging: CLOUD_LOGGING_ONLY
+
 images:
   - 'gcr.io/$PROJECT_ID/jarvis-telegram-bot:latest'
