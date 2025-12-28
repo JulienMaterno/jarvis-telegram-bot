@@ -740,7 +740,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             pending_contact_creation.pop(user_id, None)
             
+            # Check if intelligence service URL is configured
+            if not INTELLIGENCE_SERVICE_URL:
+                logger.error("INTELLIGENCE_SERVICE_URL not configured - cannot link contact")
+                await update.message.reply_text("❌ Intelligence service not configured.")
+                return
+            
             try:
+                logger.info(f"Linking meeting {meeting_id} to contact {contact_id} ({contact_name})")
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.patch(
                         f"{INTELLIGENCE_SERVICE_URL}/api/v1/meetings/{meeting_id}/link-contact",
@@ -754,11 +761,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                             await update.message.reply_text(f"✅ Linked to: {contact_name} ({company})")
                         else:
                             await update.message.reply_text(f"✅ Linked to: {contact_name}")
-                        logger.info(f"Linked meeting {meeting_id} to contact {contact_id}")
+                        logger.info(f"Successfully linked meeting {meeting_id} to contact {contact_id}")
                     else:
+                        logger.error(f"Failed to link contact - status={response.status_code}, response={response.text}")
                         await update.message.reply_text(f"❌ Failed to link: {response.text}")
             except Exception as e:
-                logger.error(f"Error linking contact: {e}")
+                logger.error(f"Error linking contact: {e}", exc_info=True)
                 await update.message.reply_text(f"❌ Error: {str(e)}")
             return
         else:
