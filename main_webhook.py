@@ -45,7 +45,8 @@ bot_app = None
 pending_contact_actions = {}
 
 # Store users waiting to type a contact name or selection
-# Format: { user_id: {"meeting_id": ..., "searched_name": ..., "mode": ..., "suggestions": [...], "expires": timestamp} }
+# Format: { user_id: {"pending_links": [...], "current_index": 0} }
+# pending_links is a queue of unmatched contacts to process one by one
 pending_contact_creation = {}
 
 # Track recently processed file IDs to prevent duplicates (TTL ~5 minutes)
@@ -161,6 +162,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if _is_duplicate_file(voice.file_unique_id):
         logger.warning(f"Duplicate voice message detected, skipping: {voice.file_unique_id}")
         return
+    
+    # Clear any pending contact linking - new voice message takes priority
+    if _clear_pending_contacts(user.id):
+        logger.info(f"Cleared pending contact linking for user {user.id} (new voice message)")
     
     logger.info(f"Received voice message from {user.username} ({user.id})")
     
@@ -287,6 +292,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.warning(f"Duplicate audio file detected, skipping: {audio.file_unique_id}")
         return
     
+    # Clear any pending contact linking - new audio message takes priority
+    if _clear_pending_contacts(user.id):
+        logger.info(f"Cleared pending contact linking for user {user.id} (new audio message)")
+    
     logger.info(f"Received audio file from {user.username} ({user.id})")
     
     status_msg = await update.message.reply_text("⏳ Processing audio file...")
@@ -403,13 +412,19 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 def build_contact_text_prompt(contact_matches: list, meeting_ids: list, user_id: int) -> str | None:
     """
     Build a text-based prompt for contact linking (works in Beeper/bridges).
-    Stores pending action in pending_contact_creation for the user.
-    Returns the prompt text or None if no action needed.
+    Queues ALL unmatched contacts for the user to process one by one.
+    Returns the prompt text for the FIRST unmatched contact, or None if all matched.
+    
+    Key behavior:
+    - Multiple unmatched contacts are QUEUED, not overwritten
+    - No time-based timeout - expires when user sends new voice message
+    - User processes contacts one at a time
     """
     if not contact_matches:
         return None
     
     prompts = []
+    pending_links = []  # Queue of unmatched contacts to process
     
     for i, match in enumerate(contact_matches):
         meeting_id = match.get('meeting_id') or (meeting_ids[i] if i < len(meeting_ids) else None)
@@ -429,20 +444,32 @@ def build_contact_text_prompt(contact_matches: list, meeting_ids: list, user_id:
                 prompts.append(f"👤 Linked to: {linked_name}")
             continue
         
+        # Queue this unmatched contact for later processing
         suggestions = match.get('suggestions', [])
-        
-        # Store pending action for this user
-        pending_contact_creation[user_id] = {
+        pending_links.append({
             'meeting_id': meeting_id,
             'searched_name': searched_name,
             'suggestions': suggestions,
-            'mode': 'link_or_create',
-            'expires': time.time() + 600  # 10 minutes
+            'mode': 'link_or_create'
+        })
+    
+    # Store the queue if we have unmatched contacts
+    if pending_links:
+        pending_contact_creation[user_id] = {
+            'pending_links': pending_links,
+            'current_index': 0
         }
         
+        # Build prompt for the FIRST unmatched contact
+        first_contact = pending_links[0]
+        searched_name = first_contact['searched_name']
+        suggestions = first_contact['suggestions']
+        
+        total_pending = len(pending_links)
+        progress_note = f"(1/{total_pending})" if total_pending > 1 else ""
+        
         if suggestions:
-            # Build numbered list of suggestions
-            prompt_lines = [f"❓ Unknown contact: *{searched_name}*", ""]
+            prompt_lines = [f"❓ Unknown contact {progress_note}: *{searched_name}*", ""]
             prompt_lines.append("Reply with:")
             for j, suggestion in enumerate(suggestions[:5], 1):
                 name = suggestion.get('name', 'Unknown')
@@ -455,9 +482,8 @@ def build_contact_text_prompt(contact_matches: list, meeting_ids: list, user_id:
             prompt_lines.append(f"  Or type the correct full name")
             prompts.append("\n".join(prompt_lines))
         else:
-            # No suggestions - ask for the name
             prompt_lines = [
-                f"❓ Unknown contact: *{searched_name}*",
+                f"❓ Unknown contact {progress_note}: *{searched_name}*",
                 "",
                 "Reply with:",
                 "  The correct full name (e.g. 'John Smith')",
@@ -466,6 +492,81 @@ def build_contact_text_prompt(contact_matches: list, meeting_ids: list, user_id:
             prompts.append("\n".join(prompt_lines))
     
     return "\n\n".join(prompts) if prompts else None
+
+
+def _get_current_pending_contact(user_id: int) -> dict | None:
+    """Get the current contact to process from the queue."""
+    if user_id not in pending_contact_creation:
+        return None
+    
+    data = pending_contact_creation[user_id]
+    pending_links = data.get('pending_links', [])
+    current_index = data.get('current_index', 0)
+    
+    if current_index >= len(pending_links):
+        # All contacts processed, clean up
+        pending_contact_creation.pop(user_id, None)
+        return None
+    
+    return pending_links[current_index]
+
+
+def _advance_to_next_contact(user_id: int) -> str | None:
+    """
+    Move to the next contact in the queue.
+    Returns the prompt for the next contact, or None if done.
+    """
+    if user_id not in pending_contact_creation:
+        return None
+    
+    data = pending_contact_creation[user_id]
+    pending_links = data.get('pending_links', [])
+    current_index = data.get('current_index', 0) + 1
+    
+    if current_index >= len(pending_links):
+        # All done!
+        pending_contact_creation.pop(user_id, None)
+        return None
+    
+    # Update index
+    pending_contact_creation[user_id]['current_index'] = current_index
+    
+    # Build prompt for next contact
+    contact = pending_links[current_index]
+    searched_name = contact['searched_name']
+    suggestions = contact['suggestions']
+    
+    total = len(pending_links)
+    progress = f"({current_index + 1}/{total})"
+    
+    if suggestions:
+        prompt_lines = [f"❓ Next contact {progress}: *{searched_name}*", ""]
+        prompt_lines.append("Reply with:")
+        for j, suggestion in enumerate(suggestions[:5], 1):
+            name = suggestion.get('name', 'Unknown')
+            company = suggestion.get('company', '')
+            if company:
+                prompt_lines.append(f"  {j} = {name} ({company})")
+            else:
+                prompt_lines.append(f"  {j} = {name}")
+        prompt_lines.append(f"  0 = Skip")
+        prompt_lines.append(f"  Or type the correct full name")
+        return "\n".join(prompt_lines)
+    else:
+        return (
+            f"❓ Next contact {progress}: *{searched_name}*\n\n"
+            "Reply with:\n"
+            "  The correct full name (e.g. 'John Smith')\n"
+            "  Or '0' to skip"
+        )
+
+
+def _clear_pending_contacts(user_id: int) -> bool:
+    """Clear any pending contact linking for a user. Returns True if there was pending work."""
+    if user_id in pending_contact_creation:
+        pending_contact_creation.pop(user_id, None)
+        return True
+    return False
 
 
 def build_contact_keyboard(contact_matches: list, meeting_ids: list) -> InlineKeyboardMarkup | None:
@@ -700,7 +801,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     # Check if this user is in the middle of contact linking
-    if user_id not in pending_contact_creation:
+    current_contact = _get_current_pending_contact(user_id)
+    if not current_contact:
         # Not expecting input, provide help
         await update.message.reply_text(
             "👋 Send me a voice message or audio file to process!\n\n"
@@ -708,25 +810,20 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     
-    # Check if the pending action has expired
-    creation_data = pending_contact_creation.get(user_id)
-    if creation_data.get('expires', 0) < time.time():
-        pending_contact_creation.pop(user_id, None)
-        await update.message.reply_text(
-            "⏰ Action timed out. Please process a new audio message."
-        )
-        return
-    
-    # Get the pending creation data
-    meeting_id = creation_data['meeting_id']
-    searched_name = creation_data.get('searched_name', 'Unknown')
-    suggestions = creation_data.get('suggestions', [])
+    # Get the current contact data from queue
+    meeting_id = current_contact['meeting_id']
+    searched_name = current_contact.get('searched_name', 'Unknown')
+    suggestions = current_contact.get('suggestions', [])
     typed_text = update.message.text.strip()
     
-    # Handle '0' = skip
+    # Handle '0' = skip this contact
     if typed_text == '0':
-        pending_contact_creation.pop(user_id, None)
-        await update.message.reply_text("⏭️ Skipped contact linking.")
+        # Move to next contact in queue
+        next_prompt = _advance_to_next_contact(user_id)
+        if next_prompt:
+            await update.message.reply_text(f"⏭️ Skipped.\n\n{next_prompt}")
+        else:
+            await update.message.reply_text("⏭️ Skipped. All contacts processed!")
         return
     
     # Handle numeric selection (1, 2, 3, etc.)
@@ -737,8 +834,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             selected = suggestions[selection - 1]
             contact_id = selected.get('id')
             contact_name = selected.get('name', 'Unknown')
-            
-            pending_contact_creation.pop(user_id, None)
             
             # Check if intelligence service URL is configured
             if not INTELLIGENCE_SERVICE_URL:
@@ -757,11 +852,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                     if response.status_code == 200:
                         result = response.json()
                         company = result.get('company', '')
-                        if company:
-                            await update.message.reply_text(f"✅ Linked to: {contact_name} ({company})")
-                        else:
-                            await update.message.reply_text(f"✅ Linked to: {contact_name}")
+                        link_msg = f"✅ Linked to: {contact_name}" + (f" ({company})" if company else "")
                         logger.info(f"Successfully linked meeting {meeting_id} to contact {contact_id}")
+                        
+                        # Move to next contact
+                        next_prompt = _advance_to_next_contact(user_id)
+                        if next_prompt:
+                            await update.message.reply_text(f"{link_msg}\n\n{next_prompt}")
+                        else:
+                            await update.message.reply_text(f"{link_msg}\n\n✅ All contacts processed!")
                     else:
                         logger.error(f"Failed to link contact - status={response.status_code}, response={response.text}")
                         await update.message.reply_text(f"❌ Failed to link: {response.text}")
@@ -774,7 +873,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
     
     # User typed a name - search or create
-    pending_contact_creation.pop(user_id, None)
     typed_name = typed_text
     
     if not typed_name or len(typed_name) < 2:
@@ -802,16 +900,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if search_response.status_code == 200:
                 existing_contacts = search_response.json().get('contacts', [])
             
-            # If we found matches, store and ask user to select
+            # If we found matches, update current contact's suggestions and ask user to select
             if existing_contacts:
-                # Store new pending with these suggestions
-                pending_contact_creation[user_id] = {
-                    'meeting_id': meeting_id,
-                    'searched_name': typed_name,
-                    'suggestions': existing_contacts,
-                    'mode': 'select_or_create',
-                    'expires': time.time() + 300
-                }
+                # Update the current contact in the queue with new suggestions
+                if user_id in pending_contact_creation:
+                    data = pending_contact_creation[user_id]
+                    idx = data.get('current_index', 0)
+                    if idx < len(data.get('pending_links', [])):
+                        data['pending_links'][idx]['suggestions'] = existing_contacts
+                        data['pending_links'][idx]['searched_name'] = typed_name
                 
                 prompt_lines = [f"Found existing contacts matching '{typed_name}':", ""]
                 for j, contact in enumerate(existing_contacts[:5], 1):
@@ -842,8 +939,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if response.status_code == 200:
                 result = response.json()
                 contact_name = result.get('contact_name', typed_name)
-                await update.message.reply_text(f"✅ Created and linked: {contact_name}")
+                create_msg = f"✅ Created and linked: {contact_name}"
                 logger.info(f"Created contact '{contact_name}' and linked to meeting {meeting_id}")
+                
+                # Move to next contact
+                next_prompt = _advance_to_next_contact(user_id)
+                if next_prompt:
+                    await update.message.reply_text(f"{create_msg}\n\n{next_prompt}")
+                else:
+                    await update.message.reply_text(f"{create_msg}\n\n✅ All contacts processed!")
             else:
                 await update.message.reply_text(f"❌ Failed to create contact: {response.text}")
                 
