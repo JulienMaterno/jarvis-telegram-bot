@@ -40,6 +40,10 @@ ALLOWED_USER_IDS = [int(id.strip()) for id in os.getenv('ALLOWED_USER_IDS', '').
 # Global bot application
 bot_app = None
 
+# Supabase client for chat history persistence
+SUPABASE_URL = os.getenv('SUPABASE_URL', '').strip()
+SUPABASE_KEY = os.getenv('SUPABASE_KEY', '').strip()
+
 # Store pending contact actions (in-memory, good enough for single instance)
 # Format: { "short_key": {"meeting_id": ..., "searched_name": ..., ...} }
 pending_contact_actions = {}
@@ -53,12 +57,8 @@ pending_contact_creation = {}
 # Format: { file_unique_id: timestamp }
 recently_processed_files = {}
 
-# Conversation history for AI chat (per user)
-# Format: { user_id: [{"role": "user/assistant", "content": "..."}, ...] }
-# Keeps last 20 messages per user, auto-cleans old entries
-conversation_history = {}
-MAX_HISTORY_PER_USER = 20
-MAX_HISTORY_AGE_HOURS = 24
+# How many messages to show AI (stored permanently, but only last N used for context)
+MAX_HISTORY_FOR_AI = 10
 
 # Counter for generating short callback keys (avoids 64-byte Telegram limit)
 _callback_counter = 0
@@ -71,34 +71,66 @@ def _short_key(prefix: str) -> str:
 
 
 def _get_conversation_history(user_id: int) -> list:
-    """Get conversation history for a user, cleaning old entries."""
-    if user_id not in conversation_history:
+    """Get conversation history from Supabase (last N messages for AI context)."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
         return []
     
-    history = conversation_history[user_id]
-    
-    # Clean entries older than MAX_HISTORY_AGE_HOURS
-    cutoff = time.time() - (MAX_HISTORY_AGE_HOURS * 3600)
-    history = [msg for msg in history if msg.get("timestamp", 0) > cutoff]
-    
-    # Return without timestamps (API doesn't need them)
-    return [{"role": msg["role"], "content": msg["content"]} for msg in history[-MAX_HISTORY_PER_USER:]]
+    try:
+        response = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/chat_messages",
+            headers={
+                'apikey': SUPABASE_KEY,
+                'Authorization': f'Bearer {SUPABASE_KEY}'
+            },
+            params={
+                'select': 'role,content',
+                'user_id': f'eq.{user_id}',
+                'order': 'created_at.desc',
+                'limit': str(MAX_HISTORY_FOR_AI)
+            },
+            timeout=5.0
+        )
+        
+        if response.status_code == 200:
+            messages = response.json()
+            # Reverse to get chronological order (oldest first)
+            return list(reversed(messages))
+        else:
+            logger.warning(f"Failed to get chat history: {response.status_code}")
+            return []
+    except Exception as e:
+        logger.error(f"Error fetching chat history: {e}")
+        return []
 
 
-def _add_to_conversation_history(user_id: int, role: str, content: str) -> None:
-    """Add a message to conversation history."""
-    if user_id not in conversation_history:
-        conversation_history[user_id] = []
+def _add_to_conversation_history(user_id: int, role: str, content: str, tools_used: list = None) -> None:
+    """Save a message to Supabase chat_messages table (permanent storage)."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
     
-    conversation_history[user_id].append({
-        "role": role,
-        "content": content,
-        "timestamp": time.time()
-    })
-    
-    # Keep only last N messages
-    if len(conversation_history[user_id]) > MAX_HISTORY_PER_USER * 2:
-        conversation_history[user_id] = conversation_history[user_id][-MAX_HISTORY_PER_USER:]
+    try:
+        payload = {
+            "user_id": user_id,
+            "role": role,
+            "content": content[:10000],  # Limit content size
+        }
+        
+        if tools_used:
+            payload["tools_used"] = tools_used
+        
+        httpx.post(
+            f"{SUPABASE_URL}/rest/v1/chat_messages",
+            headers={
+                'apikey': SUPABASE_KEY,
+                'Authorization': f'Bearer {SUPABASE_KEY}',
+                'Content-Type': 'application/json',
+                'Prefer': 'return=minimal'
+            },
+            json=payload,
+            timeout=5.0
+        )
+    except Exception as e:
+        logger.error(f"Error saving chat message: {e}")
 
 
 def _is_duplicate_file(file_unique_id: str) -> bool:
@@ -938,9 +970,9 @@ async def _handle_ai_chat(update: Update, user_id: int) -> None:
                 ai_response = result.get("response", "Sorry, I couldn't process that.")
                 tools_used = result.get("tools_used", [])
                 
-                # Save both user message and assistant response to history
+                # Save both user message and assistant response to Supabase (permanent)
                 _add_to_conversation_history(user_id, "user", message_text)
-                _add_to_conversation_history(user_id, "assistant", ai_response)
+                _add_to_conversation_history(user_id, "assistant", ai_response, tools_used)
                 
                 # Add subtle indicator if tools were used
                 if tools_used:
