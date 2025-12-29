@@ -117,14 +117,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /help is issued."""
     await update.message.reply_text(
-        "🎙️ *How to use Jarvis:*\n\n"
-        "1. Send a voice message (hold mic button)\n"
-        "2. I'll upload it for processing\n"
-        "3. Results will be in your Supabase database\n\n"
-        "*Tips:*\n"
-        "• Speak clearly\n"
-        "• Start with context: 'Meeting with John...'\n"
-        "• Mention names and dates clearly",
+        "🤖 *Jarvis - Your Personal AI Assistant*\n\n"
+        "*Voice Messages:*\n"
+        "🎙️ Send a voice memo and I'll:\n"
+        "• Transcribe it\n"
+        "• Extract meetings, tasks, reflections\n"
+        "• Save to your knowledge base\n\n"
+        "*Chat with Your Data:*\n"
+        "💬 Just type a message to:\n"
+        "• Ask questions: _'When did I last meet John?'_\n"
+        "• Search: _'What tasks are pending?'_\n"
+        "• Create: _'Add task: call dentist'_\n"
+        "• Query: _'What meetings this week?'_\n\n"
+        "*Commands:*\n"
+        "/help - Show this message\n"
+        "/cancel - Cancel current operation",
         parse_mode='Markdown'
     )
 
@@ -791,7 +798,7 @@ async def handle_create_contact(query, callback_data: str, action_data: dict) ->
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages - used for typing contact names or selections."""
+    """Handle text messages - used for typing contact names, selections, or AI chat."""
     user = update.effective_user
     user_id = user.id
     
@@ -802,13 +809,77 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # Check if this user is in the middle of contact linking
     current_contact = _get_current_pending_contact(user_id)
-    if not current_contact:
-        # Not expecting input, provide help
+    if current_contact:
+        # Handle contact linking flow
+        await _handle_contact_linking(update, user_id, current_contact)
+        return
+    
+    # Not in contact linking mode - send to AI chat
+    await _handle_ai_chat(update, user_id)
+
+
+async def _handle_ai_chat(update: Update, user_id: int) -> None:
+    """Send message to Intelligence Service for AI-powered conversation."""
+    message_text = update.message.text.strip()
+    
+    if not INTELLIGENCE_SERVICE_URL:
         await update.message.reply_text(
             "👋 Send me a voice message or audio file to process!\n\n"
             "Type /help for more info."
         )
         return
+    
+    # Send typing indicator
+    await update.message.chat.send_action("typing")
+    
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{INTELLIGENCE_SERVICE_URL}/api/v1/chat",
+                json={
+                    "message": message_text,
+                    "conversation_history": []  # Could add conversation memory later
+                }
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                ai_response = result.get("response", "Sorry, I couldn't process that.")
+                tools_used = result.get("tools_used", [])
+                
+                # Add subtle indicator if tools were used
+                if tools_used:
+                    ai_response += f"\n\n_📊 Queried: {', '.join(tools_used)}_"
+                
+                # Send response (handle Telegram's 4096 char limit)
+                if len(ai_response) > 4000:
+                    # Split into chunks
+                    for i in range(0, len(ai_response), 4000):
+                        await update.message.reply_text(
+                            ai_response[i:i+4000],
+                            parse_mode='Markdown'
+                        )
+                else:
+                    await update.message.reply_text(ai_response, parse_mode='Markdown')
+            else:
+                logger.error(f"Chat API error: {response.status_code} - {response.text}")
+                await update.message.reply_text(
+                    "❌ Sorry, I couldn't process that. Try again later."
+                )
+                
+    except httpx.TimeoutException:
+        await update.message.reply_text(
+            "⏱️ That query is taking too long. Try a simpler question."
+        )
+    except Exception as e:
+        logger.error(f"Chat error: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ Something went wrong. Please try again."
+        )
+
+
+async def _handle_contact_linking(update: Update, user_id: int, current_contact: dict) -> None:
+    """Handle text input during contact linking flow."""
     
     # Get the current contact data from queue
     meeting_id = current_contact['meeting_id']
