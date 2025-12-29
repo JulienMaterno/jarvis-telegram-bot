@@ -413,6 +413,56 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # =========================================================================
+# LOCATION HANDLING
+# =========================================================================
+
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle location messages - update user's location for timezone awareness."""
+    user = update.effective_user
+    
+    if not is_authorized(user.id):
+        await update.message.reply_text("❌ You are not authorized to use this bot.")
+        return
+    
+    location = update.message.location
+    logger.info(f"Received location from {user.username}: {location.latitude}, {location.longitude}")
+    
+    if not INTELLIGENCE_SERVICE_URL:
+        await update.message.reply_text("⚠️ Intelligence service not configured.")
+        return
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Send location to Intelligence Service
+            response = await client.post(
+                f"{INTELLIGENCE_SERVICE_URL}/api/v1/location",
+                json={
+                    "latitude": location.latitude,
+                    "longitude": location.longitude
+                }
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                city = result.get("city", "Unknown")
+                tz = result.get("timezone", "UTC")
+                
+                await update.message.reply_text(
+                    f"📍 *Location updated!*\n\n"
+                    f"🏙️ City: {city}\n"
+                    f"🕐 Timezone: {tz}\n\n"
+                    f"I'll now use your timezone for scheduling and time-related questions.",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(f"⚠️ Failed to update location: {response.text}")
+                
+    except Exception as e:
+        logger.error(f"Location update error: {e}")
+        await update.message.reply_text(f"❌ Error updating location: {str(e)}")
+
+
+# =========================================================================
 # CONTACT LINKING HELPERS (Text-based for Beeper/bridge compatibility)
 # =========================================================================
 
@@ -1047,6 +1097,7 @@ async def lifespan(app: FastAPI):
     bot_app.add_handler(CommandHandler("cancel", cancel_command))
     bot_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     bot_app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
+    bot_app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     bot_app.add_handler(CallbackQueryHandler(handle_callback_query))
     
