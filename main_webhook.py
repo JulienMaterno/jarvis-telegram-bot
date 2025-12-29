@@ -53,6 +53,13 @@ pending_contact_creation = {}
 # Format: { file_unique_id: timestamp }
 recently_processed_files = {}
 
+# Conversation history for AI chat (per user)
+# Format: { user_id: [{"role": "user/assistant", "content": "..."}, ...] }
+# Keeps last 20 messages per user, auto-cleans old entries
+conversation_history = {}
+MAX_HISTORY_PER_USER = 20
+MAX_HISTORY_AGE_HOURS = 24
+
 # Counter for generating short callback keys (avoids 64-byte Telegram limit)
 _callback_counter = 0
 
@@ -61,6 +68,37 @@ def _short_key(prefix: str) -> str:
     global _callback_counter
     _callback_counter += 1
     return f"{prefix}:{_callback_counter}"
+
+
+def _get_conversation_history(user_id: int) -> list:
+    """Get conversation history for a user, cleaning old entries."""
+    if user_id not in conversation_history:
+        return []
+    
+    history = conversation_history[user_id]
+    
+    # Clean entries older than MAX_HISTORY_AGE_HOURS
+    cutoff = time.time() - (MAX_HISTORY_AGE_HOURS * 3600)
+    history = [msg for msg in history if msg.get("timestamp", 0) > cutoff]
+    
+    # Return without timestamps (API doesn't need them)
+    return [{"role": msg["role"], "content": msg["content"]} for msg in history[-MAX_HISTORY_PER_USER:]]
+
+
+def _add_to_conversation_history(user_id: int, role: str, content: str) -> None:
+    """Add a message to conversation history."""
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    
+    conversation_history[user_id].append({
+        "role": role,
+        "content": content,
+        "timestamp": time.time()
+    })
+    
+    # Keep only last N messages
+    if len(conversation_history[user_id]) > MAX_HISTORY_PER_USER * 2:
+        conversation_history[user_id] = conversation_history[user_id][-MAX_HISTORY_PER_USER:]
 
 
 def _is_duplicate_file(file_unique_id: str) -> bool:
@@ -882,13 +920,16 @@ async def _handle_ai_chat(update: Update, user_id: int) -> None:
     # Send typing indicator
     await update.message.chat.send_action("typing")
     
+    # Get conversation history for context
+    history = _get_conversation_history(user_id)
+    
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 f"{INTELLIGENCE_SERVICE_URL}/api/v1/chat",
                 json={
                     "message": message_text,
-                    "conversation_history": []  # Could add conversation memory later
+                    "conversation_history": history
                 }
             )
             
@@ -896,6 +937,10 @@ async def _handle_ai_chat(update: Update, user_id: int) -> None:
                 result = response.json()
                 ai_response = result.get("response", "Sorry, I couldn't process that.")
                 tools_used = result.get("tools_used", [])
+                
+                # Save both user message and assistant response to history
+                _add_to_conversation_history(user_id, "user", message_text)
+                _add_to_conversation_history(user_id, "assistant", ai_response)
                 
                 # Add subtle indicator if tools were used
                 if tools_used:
