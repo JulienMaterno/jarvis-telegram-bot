@@ -979,15 +979,22 @@ async def _handle_ai_chat(update: Update, user_id: int) -> None:
                     ai_response += f"\n\n_📊 Queried: {', '.join(tools_used)}_"
                 
                 # Send response (handle Telegram's 4096 char limit)
+                async def send_with_fallback(text: str):
+                    """Try Markdown first, fall back to plain text if parsing fails."""
+                    try:
+                        await update.message.reply_text(text, parse_mode='Markdown')
+                    except Exception as markdown_error:
+                        logger.warning(f"Markdown parsing failed, sending plain: {markdown_error}")
+                        # Strip markdown formatting and send plain
+                        plain_text = text.replace('**', '').replace('__', '').replace('_', '').replace('`', '')
+                        await update.message.reply_text(plain_text)
+                
                 if len(ai_response) > 4000:
                     # Split into chunks
                     for i in range(0, len(ai_response), 4000):
-                        await update.message.reply_text(
-                            ai_response[i:i+4000],
-                            parse_mode='Markdown'
-                        )
+                        await send_with_fallback(ai_response[i:i+4000])
                 else:
-                    await update.message.reply_text(ai_response, parse_mode='Markdown')
+                    await send_with_fallback(ai_response)
             else:
                 logger.error(f"Chat API error: {response.status_code} - {response.text}")
                 await update.message.reply_text(
