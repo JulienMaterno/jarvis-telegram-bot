@@ -133,6 +133,70 @@ def _add_to_conversation_history(user_id: int, role: str, content: str, tools_us
         logger.error(f"Error saving chat message: {e}")
 
 
+def _build_voice_memo_history_entry(details: dict, summary: str, category: str = None) -> dict:
+    """
+    Build context entries for chat history from voice memo processing results.
+    This allows the AI to reference what was just processed when user asks follow-up questions.
+    
+    Returns:
+        dict with 'user_context' (what user "said") and 'assistant_summary' (what was created)
+    """
+    # Build user context - what the voice memo contained
+    transcript_id = details.get("transcript_id", "")
+    transcript_length = details.get("transcript_length", 0)
+    
+    user_parts = [f"I sent a voice memo ({transcript_length} chars transcribed)."]
+    
+    if category:
+        user_parts.append(f"Category: {category}")
+    
+    # Build assistant summary - what was created
+    assistant_parts = [f"Processed your voice memo. {summary}"]
+    
+    # Add created item IDs for reference
+    created_items = []
+    
+    meeting_ids = details.get("meeting_ids", [])
+    if meeting_ids:
+        created_items.append(f"Meeting IDs: {', '.join(meeting_ids[:3])}")  # Limit to 3
+    
+    journal_ids = details.get("journal_ids", [])
+    if journal_ids:
+        created_items.append(f"Journal ID: {journal_ids[0]}")
+    
+    reflection_ids = details.get("reflection_ids", [])
+    if reflection_ids:
+        created_items.append(f"Reflection IDs: {', '.join(reflection_ids[:3])}")
+    
+    task_ids = details.get("task_ids", [])
+    if task_ids:
+        created_items.append(f"Task IDs: {', '.join(task_ids[:5])}")  # Limit to 5
+    
+    if transcript_id:
+        created_items.append(f"Transcript ID: {transcript_id}")
+    
+    if created_items:
+        assistant_parts.append(f"Created records: {'; '.join(created_items)}")
+    
+    # Add contact match info
+    contact_matches = details.get("contact_matches", [])
+    if contact_matches:
+        match_info = []
+        for cm in contact_matches[:3]:  # Limit to 3
+            name = cm.get("searched_name", "Unknown")
+            if cm.get("matched"):
+                match_info.append(f"{name} (linked)")
+            else:
+                match_info.append(f"{name} (unlinked)")
+        if match_info:
+            assistant_parts.append(f"People mentioned: {', '.join(match_info)}")
+    
+    return {
+        "user_context": " ".join(user_parts),
+        "assistant_summary": " ".join(assistant_parts)
+    }
+
+
 def _is_duplicate_file(file_unique_id: str) -> bool:
     """Check if file was recently processed (deduplication)."""
     import time
@@ -300,6 +364,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                                 parse_mode='Markdown'
                             )
                             
+                            # ====================================================
+                            # ADD TO CHAT HISTORY (so AI can reference this)
+                            # ====================================================
+                            voice_memo_context = _build_voice_memo_history_entry(
+                                details, summary, result.get("category")
+                            )
+                            _add_to_conversation_history(
+                                user.id, 
+                                "user", 
+                                f"[Voice Memo Sent]\n{voice_memo_context['user_context']}"
+                            )
+                            _add_to_conversation_history(
+                                user.id, 
+                                "assistant", 
+                                voice_memo_context['assistant_summary']
+                            )
+                            
                             # Send contact prompt separately if needed
                             if contact_prompt:
                                 await update.message.reply_text(contact_prompt)
@@ -432,6 +513,24 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                                     f"📝 Transcript: {details.get('transcript_length', 0)} chars",
                                     parse_mode='Markdown'
                                 )
+                            
+                            # ====================================================
+                            # ADD TO CHAT HISTORY (so AI can reference this)
+                            # ====================================================
+                            voice_memo_context = _build_voice_memo_history_entry(
+                                details, summary, result.get("category")
+                            )
+                            _add_to_conversation_history(
+                                user.id, 
+                                "user", 
+                                f"[Audio File Sent]\n{voice_memo_context['user_context']}"
+                            )
+                            _add_to_conversation_history(
+                                user.id, 
+                                "assistant", 
+                                voice_memo_context['assistant_summary']
+                            )
+                            
                             logger.info(f"Direct processing successful: {summary}")
                             return
                         else:
