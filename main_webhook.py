@@ -404,19 +404,52 @@ async def process_audio_in_background(
                 auth_headers["Authorization"] = f"Bearer {identity_token}"
             
             # Use a very long timeout for big files (2 hours of audio = ~30 min processing)
-            async with httpx.AsyncClient(timeout=3600.0) as client:
-                files = {'file': (filename, file_bytes, mimetype)}
-                data = {'username': username}
-                
-                response = await client.post(
-                    f"{AUDIO_PIPELINE_URL}/process/upload",
-                    files=files,
-                    data=data,
-                    headers=auth_headers
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
+            # Retry logic for 503 errors (service temporarily unavailable)
+            max_retries = 3
+            retry_delay = 30  # seconds
+            
+            for attempt in range(max_retries):
+                try:
+                    async with httpx.AsyncClient(timeout=3600.0) as client:
+                        files = {'file': (filename, file_bytes, mimetype)}
+                        data = {'username': username}
+                        
+                        response = await client.post(
+                            f"{AUDIO_PIPELINE_URL}/process/upload",
+                            files=files,
+                            data=data,
+                            headers=auth_headers
+                        )
+                        
+                        # Handle 503 Service Unavailable - pipeline might be overloaded or restarting
+                        if response.status_code == 503:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Pipeline returned 503, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})")
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"⏳ Pipeline busy, retrying `{filename}` in {retry_delay}s...",
+                                    parse_mode='Markdown'
+                                )
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2  # Exponential backoff
+                                continue
+                            else:
+                                # Final attempt failed
+                                raise Exception(f"Pipeline unavailable after {max_retries} attempts")
+                        
+                        # Success or other error - break out of retry loop
+                        break
+                        
+                except httpx.TimeoutException:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Pipeline timeout, retrying (attempt {attempt + 1}/{max_retries})")
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2
+                        continue
+                    raise
+            
+            if response.status_code == 200:
+                result = response.json()
                     
                     if result.get("status") == "success":
                         summary = result.get("summary", "Processed successfully")
