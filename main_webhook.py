@@ -99,11 +99,16 @@ MAX_HISTORY_FOR_AI = 10
 _callback_counter = 0
 
 # Background processing queue - tracks audio files being processed
-# Format: { file_unique_id: {"chat_id": int, "user_id": int, "status_msg_id": int, "started_at": float} }
+# Format: { file_unique_id: {"chat_id": int, "user_id": int, "filename": str, "started_at": float} }
 background_processing = {}
 
 # Lock for thread-safe access to background_processing dict
 _processing_lock = asyncio.Lock()
+
+# Semaphore to limit concurrent audio processing (prevent overwhelming the pipeline)
+# Allows 3 concurrent processing tasks - more would overload Modal GPU
+MAX_CONCURRENT_AUDIO = 3
+_audio_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AUDIO)
 
 def _short_key(prefix: str) -> str:
     """Generate a short unique callback key to stay under Telegram's 64-byte limit."""
@@ -342,104 +347,134 @@ async def process_audio_in_background(
     filename: str,
     mimetype: str,
     file_unique_id: str,
-    status_msg_id: int
+    is_queued: bool = False
 ) -> None:
     """
     Process audio file in the background without blocking the webhook.
     
-    This allows users to continue chatting while long audio files (2+ hours)
-    are being transcribed and analyzed.
+    Uses a semaphore to limit concurrent processing and prevent overloading
+    the audio pipeline. If MAX_CONCURRENT_AUDIO tasks are already running,
+    new tasks wait in queue.
+    
+    This allows users to continue chatting while audio files are being
+    transcribed and analyzed (even for 2+ hour recordings).
     """
-    logger.info(f"Background processing started for {filename} ({len(file_bytes)} bytes)")
+    queue_position = 0
     
     try:
-        # Track this processing
-        async with _processing_lock:
-            background_processing[file_unique_id] = {
-                "chat_id": chat_id,
-                "user_id": user_id,
-                "started_at": time.time(),
-                "filename": filename
-            }
-        
-        # Get authentication headers
-        auth_headers = {}
-        identity_token = get_identity_token(AUDIO_PIPELINE_URL)
-        if identity_token:
-            auth_headers["Authorization"] = f"Bearer {identity_token}"
-        
-        # Use a very long timeout for big files (2 hours of audio = ~30 min processing)
-        async with httpx.AsyncClient(timeout=3600.0) as client:
-            files = {'file': (filename, file_bytes, mimetype)}
-            data = {'username': username}
+        # Check if we need to queue (semaphore not immediately available)
+        if _audio_semaphore.locked():
+            # Count how many are waiting
+            async with _processing_lock:
+                queue_position = len(background_processing)
             
-            response = await client.post(
-                f"{AUDIO_PIPELINE_URL}/process/upload",
-                files=files,
-                data=data,
-                headers=auth_headers
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                
-                if result.get("status") == "success":
-                    summary = result.get("summary", "Processed successfully")
-                    details = result.get("details", {})
-                    
-                    # Build success message
-                    message = (
-                        f"✅ *Audio processed!*\n\n"
-                        f"📁 `{filename}`\n\n"
-                        f"{summary}\n\n"
-                        f"📝 Transcript: {details.get('transcript_length', 0)} chars"
-                    )
-                    
-                    # Send completion notification as NEW message (not edit)
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=message,
-                        parse_mode='Markdown'
-                    )
-                    
-                    # Add to chat history
-                    voice_memo_context = _build_voice_memo_history_entry(
-                        details, summary, result.get("category")
-                    )
-                    _add_to_conversation_history(
-                        user_id,
-                        "user",
-                        f"[Audio File Processed]\n{voice_memo_context['user_context']}"
-                    )
-                    _add_to_conversation_history(
-                        user_id,
-                        "assistant",
-                        voice_memo_context['assistant_summary']
-                    )
-                    
-                    # Check for contact linking needs
-                    contact_matches = details.get("contact_matches", [])
-                    meeting_ids = details.get("meeting_ids", [])
-                    contact_prompt = build_contact_text_prompt(
-                        contact_matches, meeting_ids, user_id
-                    )
-                    if contact_prompt:
-                        await bot.send_message(chat_id=chat_id, text=contact_prompt)
-                    
-                    logger.info(f"Background processing completed: {filename}")
-                else:
-                    error = result.get("error", "Unknown error")
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"⚠️ Processing completed with issues:\n{error}"
-                    )
-                    logger.warning(f"Pipeline returned error for {filename}: {error}")
-            else:
+            if not is_queued:
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=f"❌ Audio pipeline error: HTTP {response.status_code}"
+                    text=f"⏳ `{filename}` is queued (position {queue_position}).\n"
+                         f"Currently processing {MAX_CONCURRENT_AUDIO} other file(s).",
+                    parse_mode='Markdown'
                 )
-                logger.error(f"Pipeline returned {response.status_code} for {filename}")
+        
+        # Acquire semaphore (wait if at capacity)
+        async with _audio_semaphore:
+            logger.info(f"Background processing started for {filename} ({len(file_bytes)} bytes)")
+            
+            # Track this processing
+            async with _processing_lock:
+                background_processing[file_unique_id] = {
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "started_at": time.time(),
+                    "filename": filename
+                }
+            
+            # Notify user we've started (only if was queued)
+            if queue_position > 0:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🔄 Now processing `{filename}`...",
+                    parse_mode='Markdown'
+                )
+            
+            # Get authentication headers
+            auth_headers = {}
+            identity_token = get_identity_token(AUDIO_PIPELINE_URL)
+            if identity_token:
+                auth_headers["Authorization"] = f"Bearer {identity_token}"
+            
+            # Use a very long timeout for big files (2 hours of audio = ~30 min processing)
+            async with httpx.AsyncClient(timeout=3600.0) as client:
+                files = {'file': (filename, file_bytes, mimetype)}
+                data = {'username': username}
+                
+                response = await client.post(
+                    f"{AUDIO_PIPELINE_URL}/process/upload",
+                    files=files,
+                    data=data,
+                    headers=auth_headers
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    if result.get("status") == "success":
+                        summary = result.get("summary", "Processed successfully")
+                        details = result.get("details", {})
+                        
+                        # Build success message
+                        message = (
+                            f"✅ *Audio processed!*\n\n"
+                            f"📁 `{filename}`\n\n"
+                            f"{summary}\n\n"
+                            f"📝 Transcript: {details.get('transcript_length', 0)} chars"
+                        )
+                        
+                        # Send completion notification as NEW message
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=message,
+                            parse_mode='Markdown'
+                        )
+                        
+                        # Add to chat history
+                        voice_memo_context = _build_voice_memo_history_entry(
+                            details, summary, result.get("category")
+                        )
+                        _add_to_conversation_history(
+                            user_id,
+                            "user",
+                            f"[Audio File Processed]\n{voice_memo_context['user_context']}"
+                        )
+                        _add_to_conversation_history(
+                            user_id,
+                            "assistant",
+                            voice_memo_context['assistant_summary']
+                        )
+                        
+                        # Check for contact linking needs
+                        contact_matches = details.get("contact_matches", [])
+                        meeting_ids = details.get("meeting_ids", [])
+                        contact_prompt = build_contact_text_prompt(
+                            contact_matches, meeting_ids, user_id
+                        )
+                        if contact_prompt:
+                            await bot.send_message(chat_id=chat_id, text=contact_prompt)
+                        
+                        logger.info(f"Background processing completed: {filename}")
+                    else:
+                        error = result.get("error", "Unknown error")
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=f"⚠️ Processing completed with issues:\n{error}"
+                        )
+                        logger.warning(f"Pipeline returned error for {filename}: {error}")
+                else:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ Audio pipeline error: HTTP {response.status_code}"
+                    )
+                    logger.error(f"Pipeline returned {response.status_code} for {filename}")
                 
     except asyncio.TimeoutError:
         await bot.send_message(
@@ -462,14 +497,15 @@ async def process_audio_in_background(
         async with _processing_lock:
             background_processing.pop(file_unique_id, None)
 
-
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle incoming voice messages.
     
-    Processing Strategy:
-    - Small files (< 5MB, ~10 min audio): Process synchronously for quick response
-    - Large files (>= 5MB): Process in background to avoid blocking
+    ALL audio processing happens in the background to avoid blocking the webhook.
+    Telegram expects webhook responses within 60 seconds, but audio transcription
+    can take 30-300+ seconds depending on length.
+    
+    Users can continue chatting while audio is being processed.
     """
     user = update.effective_user
     
@@ -490,22 +526,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if _clear_pending_contacts(user.id):
         logger.info(f"Cleared pending contact linking for user {user.id} (new voice message)")
     
-    # Determine file size for processing strategy
     file_size = voice.file_size or 0
-    is_large_file = file_size >= 5 * 1024 * 1024  # 5MB threshold
+    duration = voice.duration or 0
     
-    logger.info(f"Received voice message from {user.username} ({user.id}), size: {file_size} bytes, large: {is_large_file}")
+    logger.info(f"Received voice message from {user.username} ({user.id}), size: {file_size} bytes, duration: {duration}s")
     
-    # Send processing status
-    if is_large_file:
+    # Always acknowledge immediately - don't block webhook
+    if duration > 60:  # > 1 minute
         status_msg = await update.message.reply_text(
-            "🎤 *Large audio file received!*\n\n"
+            f"🎤 Voice memo received ({duration // 60}m {duration % 60}s)\n\n"
             "⏳ Processing in background - you can continue chatting.\n"
             "I'll notify you when it's done.",
             parse_mode='Markdown'
         )
     else:
-        status_msg = await update.message.reply_text("⏳ Processing voice message...")
+        status_msg = await update.message.reply_text(
+            "🎤 Voice memo received\n⏳ Processing..."
+        )
     
     try:
         # Download voice file
@@ -518,9 +555,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = f"voice_{timestamp}_{user.username or user.id}.ogg"
         
-        # For large files, process in background
-        if is_large_file and AUDIO_PIPELINE_URL:
-            # Start background task
+        if AUDIO_PIPELINE_URL:
+            # Start background task - don't block webhook
             asyncio.create_task(
                 process_audio_in_background(
                     bot=context.bot,
@@ -530,98 +566,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     file_bytes=file_bytes.getvalue(),
                     filename=filename,
                     mimetype='audio/ogg',
-                    file_unique_id=voice.file_unique_id,
-                    status_msg_id=status_msg.message_id
+                    file_unique_id=voice.file_unique_id
                 )
             )
             logger.info(f"Started background processing for {filename}")
-            return  # Don't block the webhook
+            return  # Return immediately to Telegram
         
-        # For small files, process synchronously (original behavior)
-        if AUDIO_PIPELINE_URL:
-            try:
-                await status_msg.edit_text("🔄 Transcribing and analyzing...")
-                
-                # Get identity token for Cloud Run authentication
-                auth_headers = {}
-                identity_token = get_identity_token(AUDIO_PIPELINE_URL)
-                if identity_token:
-                    auth_headers["Authorization"] = f"Bearer {identity_token}"
-                    logger.info("Using identity token for audio pipeline auth")
-                
-                async with httpx.AsyncClient(timeout=300.0) as client:
-                    # Send file directly to pipeline
-                    files = {'file': (filename, file_bytes.getvalue(), 'audio/ogg')}
-                    data = {'username': user.username or str(user.id)}
-                    
-                    response = await client.post(
-                        f"{AUDIO_PIPELINE_URL}/process/upload",
-                        files=files,
-                        data=data,
-                        headers=auth_headers
-                    )
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        
-                        if result.get("status") == "success":
-                            summary = result.get("summary", "Processed successfully")
-                            details = result.get("details", {})
-                            
-                            # Check if we need contact linking
-                            contact_matches = details.get("contact_matches", [])
-                            meeting_ids = details.get("meeting_ids", [])
-                            
-                            # Build text-based contact prompt (works in Beeper/bridges)
-                            contact_prompt = build_contact_text_prompt(
-                                contact_matches, meeting_ids, user.id
-                            )
-                            
-                            # Send main result
-                            await status_msg.edit_text(
-                                f"✅ *Voice memo processed!*\n\n"
-                                f"{summary}\n\n"
-                                f"📝 Transcript: {details.get('transcript_length', 0)} chars",
-                                parse_mode='Markdown'
-                            )
-                            
-                            # ====================================================
-                            # ADD TO CHAT HISTORY (so AI can reference this)
-                            # ====================================================
-                            voice_memo_context = _build_voice_memo_history_entry(
-                                details, summary, result.get("category")
-                            )
-                            _add_to_conversation_history(
-                                user.id, 
-                                "user", 
-                                f"[Voice Memo Sent]\n{voice_memo_context['user_context']}"
-                            )
-                            _add_to_conversation_history(
-                                user.id, 
-                                "assistant", 
-                                voice_memo_context['assistant_summary']
-                            )
-                            
-                            # Send contact prompt separately if needed
-                            if contact_prompt:
-                                await update.message.reply_text(contact_prompt)
-                            
-                            logger.info(f"Direct processing successful: {summary}")
-                            return
-                        else:
-                            logger.warning(f"Pipeline processing failed: {result.get('error')}")
-                            # Fall through to Google Drive backup
-                    else:
-                        logger.warning(f"Pipeline returned {response.status_code}")
-                        # Fall through to Google Drive backup
-                        
-            except Exception as e:
-                logger.error(f"Direct upload failed: {e}")
-                # Fall through to Google Drive backup
-        
-        # Fallback: Upload to Google Drive for scheduler processing
+        # Fallback: Upload to Google Drive if no pipeline URL
         await status_msg.edit_text("☁️ Uploading to Google Drive...")
-        file_bytes.seek(0)  # Reset stream position
+        file_bytes.seek(0)
         
         drive_service = get_drive_service()
         
@@ -660,9 +613,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """
     Handle incoming audio files (mp3, m4a, etc).
     
-    Processing Strategy:
-    - Small files (< 5MB): Process synchronously for quick response
-    - Large files (>= 5MB): Process in background to avoid blocking
+    ALL audio processing happens in the background to avoid blocking the webhook.
+    This ensures users can continue chatting while even large files (2+ hours)
+    are being transcribed and analyzed.
     """
     user = update.effective_user
     
@@ -681,22 +634,23 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if _clear_pending_contacts(user.id):
         logger.info(f"Cleared pending contact linking for user {user.id} (new audio message)")
     
-    # Determine file size for processing strategy
     file_size = audio.file_size or 0
-    is_large_file = file_size >= 5 * 1024 * 1024  # 5MB threshold
+    duration = audio.duration or 0
     
-    logger.info(f"Received audio file from {user.username} ({user.id}), size: {file_size} bytes, large: {is_large_file}")
+    logger.info(f"Received audio file from {user.username} ({user.id}), size: {file_size} bytes, duration: {duration}s")
     
-    if is_large_file:
+    # Always acknowledge immediately - don't block webhook
+    if duration > 60 or file_size > 5 * 1024 * 1024:  # > 1 minute or > 5MB
         status_msg = await update.message.reply_text(
-            "🎵 *Large audio file received!*\n\n"
-            f"📁 Size: {file_size / 1024 / 1024:.1f} MB\n\n"
+            f"🎵 Audio file received ({file_size / 1024 / 1024:.1f} MB)\n\n"
             "⏳ Processing in background - you can continue chatting.\n"
             "I'll notify you when it's done.",
             parse_mode='Markdown'
         )
     else:
-        status_msg = await update.message.reply_text("⏳ Processing audio file...")
+        status_msg = await update.message.reply_text(
+            "🎵 Audio file received\n⏳ Processing..."
+        )
     
     try:
         file = await context.bot.get_file(audio.file_id)
@@ -709,8 +663,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         mimetype = audio.mime_type or 'audio/mpeg'
         filename = f"audio_{timestamp}_{user.username or user.id}.{ext}"
         
-        # For large files, process in background
-        if is_large_file and AUDIO_PIPELINE_URL:
+        if AUDIO_PIPELINE_URL:
+            # Start background task - don't block webhook
             asyncio.create_task(
                 process_audio_in_background(
                     bot=context.bot,
@@ -720,99 +674,15 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     file_bytes=file_bytes.getvalue(),
                     filename=filename,
                     mimetype=mimetype,
-                    file_unique_id=audio.file_unique_id,
-                    status_msg_id=status_msg.message_id
+                    file_unique_id=audio.file_unique_id
                 )
             )
             logger.info(f"Started background processing for {filename}")
-            return  # Don't block the webhook
+            return  # Return immediately to Telegram
         
-        # For small files, process synchronously (original behavior)
-        if AUDIO_PIPELINE_URL:
-            try:
-                await status_msg.edit_text("🔄 Transcribing and analyzing...")
-                
-                # Get identity token for Cloud Run authentication
-                auth_headers = {}
-                identity_token = get_identity_token(AUDIO_PIPELINE_URL)
-                if identity_token:
-                    auth_headers["Authorization"] = f"Bearer {identity_token}"
-                    logger.info("Using identity token for audio pipeline auth")
-                
-                async with httpx.AsyncClient(timeout=300.0) as client:
-                    # Send file directly to pipeline
-                    files = {'file': (filename, file_bytes.getvalue(), mimetype)}
-                    data = {'username': user.username or str(user.id)}
-                    
-                    response = await client.post(
-                        f"{AUDIO_PIPELINE_URL}/process/upload",
-                        files=files,
-                        data=data,
-                        headers=auth_headers
-                    )
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        
-                        if result.get("status") == "success":
-                            summary = result.get("summary", "Processed successfully")
-                            details = result.get("details", {})
-                            
-                            # Check if we need contact linking buttons
-                            contact_matches = details.get("contact_matches", [])
-                            meeting_ids = details.get("meeting_ids", [])
-                            
-                            keyboard = build_contact_keyboard(contact_matches, meeting_ids)
-                            
-                            if keyboard:
-                                await status_msg.edit_text(
-                                    f"✅ *Audio processed!*\n\n"
-                                    f"{summary}\n\n"
-                                    f"📝 Transcript: {details.get('transcript_length', 0)} chars",
-                                    parse_mode='Markdown',
-                                    reply_markup=keyboard
-                                )
-                            else:
-                                await status_msg.edit_text(
-                                    f"✅ *Audio processed!*\n\n"
-                                    f"{summary}\n\n"
-                                    f"📝 Transcript: {details.get('transcript_length', 0)} chars",
-                                    parse_mode='Markdown'
-                                )
-                            
-                            # ====================================================
-                            # ADD TO CHAT HISTORY (so AI can reference this)
-                            # ====================================================
-                            voice_memo_context = _build_voice_memo_history_entry(
-                                details, summary, result.get("category")
-                            )
-                            _add_to_conversation_history(
-                                user.id, 
-                                "user", 
-                                f"[Audio File Sent]\n{voice_memo_context['user_context']}"
-                            )
-                            _add_to_conversation_history(
-                                user.id, 
-                                "assistant", 
-                                voice_memo_context['assistant_summary']
-                            )
-                            
-                            logger.info(f"Direct processing successful: {summary}")
-                            return
-                        else:
-                            logger.warning(f"Pipeline processing failed: {result.get('error')}")
-                            # Fall through to Google Drive backup
-                    else:
-                        logger.warning(f"Pipeline returned {response.status_code}")
-                        # Fall through to Google Drive backup
-                        
-            except Exception as e:
-                logger.error(f"Direct upload failed: {e}")
-                # Fall through to Google Drive backup
-        
-        # Fallback: Upload to Google Drive for scheduler processing
+        # Fallback: Upload to Google Drive if no pipeline URL
         await status_msg.edit_text("☁️ Uploading to Google Drive...")
-        file_bytes.seek(0)  # Reset stream position
+        file_bytes.seek(0)
         
         drive_service = get_drive_service()
         
