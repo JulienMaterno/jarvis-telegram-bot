@@ -505,7 +505,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     Telegram expects webhook responses within 60 seconds, but audio transcription
     can take 30-300+ seconds depending on length.
     
-    Users can continue chatting while audio is being processed.
+    Note: Telegram Bot API has a 20MB download limit. Voice messages rarely exceed
+    this (would need to be ~2+ hours), but if they do, we provide guidance.
     """
     user = update.effective_user
     
@@ -530,6 +531,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     duration = voice.duration or 0
     
     logger.info(f"Received voice message from {user.username} ({user.id}), size: {file_size} bytes, duration: {duration}s")
+    
+    # Check Telegram's 20MB bot download limit
+    TELEGRAM_FILE_LIMIT = 20 * 1024 * 1024  # 20MB
+    if file_size > TELEGRAM_FILE_LIMIT:
+        await update.message.reply_text(
+            f"⚠️ *File too large for Telegram Bot API*\n\n"
+            f"Your voice memo is {file_size / 1024 / 1024:.1f} MB, but Telegram limits "
+            f"bot downloads to 20 MB.\n\n"
+            f"*Alternatives:*\n"
+            f"1️⃣ Upload directly to Google Drive's 'Audio Files' folder\n"
+            f"2️⃣ Split into smaller recordings (< 20 min each)\n"
+            f"3️⃣ Send as a regular audio file (same limit applies)\n\n"
+            f"Files in Google Drive are auto-processed every 15 minutes.",
+            parse_mode='Markdown'
+        )
+        logger.warning(f"Voice file too large: {file_size} bytes > 20MB limit")
+        return
     
     # Always acknowledge immediately - don't block webhook
     if duration > 60:  # > 1 minute
@@ -614,8 +632,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     Handle incoming audio files (mp3, m4a, etc).
     
     ALL audio processing happens in the background to avoid blocking the webhook.
-    This ensures users can continue chatting while even large files (2+ hours)
-    are being transcribed and analyzed.
+    
+    Note: Telegram Bot API has a 20MB download limit. For larger files,
+    users should upload directly to Google Drive.
     """
     user = update.effective_user
     
@@ -638,6 +657,25 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     duration = audio.duration or 0
     
     logger.info(f"Received audio file from {user.username} ({user.id}), size: {file_size} bytes, duration: {duration}s")
+    
+    # Check Telegram's 20MB bot download limit
+    TELEGRAM_FILE_LIMIT = 20 * 1024 * 1024  # 20MB
+    if file_size > TELEGRAM_FILE_LIMIT:
+        duration_str = f"{duration // 60}m {duration % 60}s" if duration else "unknown"
+        await update.message.reply_text(
+            f"⚠️ *File too large for Telegram Bot API*\n\n"
+            f"📁 Size: {file_size / 1024 / 1024:.1f} MB (limit: 20 MB)\n"
+            f"⏱️ Duration: {duration_str}\n\n"
+            f"Telegram bots cannot download files larger than 20 MB.\n\n"
+            f"*How to process this file:*\n"
+            f"1️⃣ Upload to Google Drive's *'Audio Files'* folder\n"
+            f"   → It will be processed automatically within 15 min\n\n"
+            f"2️⃣ Or split into smaller parts (< 20 min each)\n\n"
+            f"_This is a Telegram platform limitation, not Jarvis._",
+            parse_mode='Markdown'
+        )
+        logger.warning(f"Audio file too large: {file_size} bytes > 20MB limit")
+        return
     
     # Always acknowledge immediately - don't block webhook
     if duration > 60 or file_size > 5 * 1024 * 1024:  # > 1 minute or > 5MB
