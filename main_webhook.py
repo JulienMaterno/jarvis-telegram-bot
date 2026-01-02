@@ -73,7 +73,14 @@ def get_identity_token(audience: str) -> Optional[str]:
     
     return None
 
-# Store users waiting to type a contact name or selection
+
+def get_auth_headers(service_url: str) -> dict:
+    """Get authorization headers for a Cloud Run service."""
+    headers = {}
+    token = get_identity_token(service_url)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers# Store users waiting to type a contact name or selection
 # Format: { user_id: {"pending_links": [...], "current_index": 0} }
 # pending_links is a queue of unmatched contacts to process one by one
 pending_contact_creation = {}
@@ -642,6 +649,7 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     
     try:
+        auth_headers = get_auth_headers(INTELLIGENCE_SERVICE_URL)
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Send location to Intelligence Service
             response = await client.post(
@@ -649,7 +657,8 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 json={
                     "latitude": location.latitude,
                     "longitude": location.longitude
-                }
+                },
+                headers=auth_headers
             )
             
             if response.status_code == 200:
@@ -964,10 +973,12 @@ async def handle_link_contact(query, callback_data: str, action_data: dict) -> N
             await query.message.reply_text("❌ Intelligence service not configured.")
             return
             
+        auth_headers = get_auth_headers(INTELLIGENCE_SERVICE_URL)
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.patch(
                 f"{INTELLIGENCE_SERVICE_URL}/api/v1/meetings/{meeting_id}/link-contact",
-                json={"contact_id": contact_id}
+                json={"contact_id": contact_id},
+                headers=auth_headers
             )
             
             if response.status_code == 200:
@@ -1096,13 +1107,15 @@ async def _handle_ai_chat(update: Update, user_id: int) -> None:
     history = _get_conversation_history(user_id)
     
     try:
+        auth_headers = get_auth_headers(INTELLIGENCE_SERVICE_URL)
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 f"{INTELLIGENCE_SERVICE_URL}/api/v1/chat",
                 json={
                     "message": message_text,
                     "conversation_history": history
-                }
+                },
+                headers=auth_headers
             )
             
             if response.status_code == 200:
@@ -1188,10 +1201,12 @@ async def _handle_contact_linking(update: Update, user_id: int, current_contact:
             
             try:
                 logger.info(f"Linking meeting {meeting_id} to contact {contact_id} ({contact_name})")
+                auth_headers = get_auth_headers(INTELLIGENCE_SERVICE_URL)
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.patch(
                         f"{INTELLIGENCE_SERVICE_URL}/api/v1/meetings/{meeting_id}/link-contact",
-                        json={"contact_id": contact_id}
+                        json={"contact_id": contact_id},
+                        headers=auth_headers
                     )
                     
                     if response.status_code == 200:
@@ -1234,11 +1249,13 @@ async def _handle_contact_linking(update: Update, user_id: int, current_contact:
             await update.message.reply_text("❌ Intelligence service not configured.")
             return
             
+        auth_headers = get_auth_headers(INTELLIGENCE_SERVICE_URL)
         async with httpx.AsyncClient(timeout=30.0) as client:
             # First, search for existing contact with this name
             search_response = await client.get(
                 f"{INTELLIGENCE_SERVICE_URL}/api/v1/contacts/search",
-                params={"q": typed_name, "limit": 5}
+                params={"q": typed_name, "limit": 5},
+                headers=auth_headers
             )
             
             existing_contacts = []
@@ -1278,7 +1295,8 @@ async def _handle_contact_linking(update: Update, user_id: int, current_contact:
             
             response = await client.post(
                 f"{INTELLIGENCE_SERVICE_URL}/api/v1/contacts",
-                json=payload
+                json=payload,
+                headers=auth_headers
             )
             
             if response.status_code == 200:
