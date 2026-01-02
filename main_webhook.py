@@ -10,7 +10,9 @@ import logging
 import httpx
 import hashlib
 import time
+import requests
 from datetime import datetime
+from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -47,6 +49,29 @@ SUPABASE_KEY = os.getenv('SUPABASE_KEY', '').strip()
 # Store pending contact actions (in-memory, good enough for single instance)
 # Format: { "short_key": {"meeting_id": ..., "searched_name": ..., ...} }
 pending_contact_actions = {}
+
+
+def get_identity_token(audience: str) -> Optional[str]:
+    """
+    Get Google Cloud identity token for service-to-service authentication.
+    
+    In Cloud Run, this uses the metadata server to get a token.
+    """
+    try:
+        # Use Cloud Run metadata server
+        metadata_url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity"
+        response = requests.get(
+            metadata_url,
+            params={"audience": audience},
+            headers={"Metadata-Flavor": "Google"},
+            timeout=2
+        )
+        if response.status_code == 200:
+            return response.text
+    except Exception as e:
+        logger.debug(f"Could not get identity token: {e}")
+    
+    return None
 
 # Store users waiting to type a contact name or selection
 # Format: { user_id: {"pending_links": [...], "current_index": 0} }
@@ -329,6 +354,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             try:
                 await status_msg.edit_text("🔄 Transcribing and analyzing...")
                 
+                # Get identity token for Cloud Run authentication
+                auth_headers = {}
+                identity_token = get_identity_token(AUDIO_PIPELINE_URL)
+                if identity_token:
+                    auth_headers["Authorization"] = f"Bearer {identity_token}"
+                    logger.info("Using identity token for audio pipeline auth")
+                
                 async with httpx.AsyncClient(timeout=300.0) as client:
                     # Send file directly to pipeline
                     files = {'file': (filename, file_bytes.getvalue(), 'audio/ogg')}
@@ -337,7 +369,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     response = await client.post(
                         f"{AUDIO_PIPELINE_URL}/process/upload",
                         files=files,
-                        data=data
+                        data=data,
+                        headers=auth_headers
                     )
                     
                     if response.status_code == 200:
@@ -474,6 +507,13 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             try:
                 await status_msg.edit_text("🔄 Transcribing and analyzing...")
                 
+                # Get identity token for Cloud Run authentication
+                auth_headers = {}
+                identity_token = get_identity_token(AUDIO_PIPELINE_URL)
+                if identity_token:
+                    auth_headers["Authorization"] = f"Bearer {identity_token}"
+                    logger.info("Using identity token for audio pipeline auth")
+                
                 async with httpx.AsyncClient(timeout=300.0) as client:
                     # Send file directly to pipeline
                     files = {'file': (filename, file_bytes.getvalue(), mimetype)}
@@ -482,7 +522,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     response = await client.post(
                         f"{AUDIO_PIPELINE_URL}/process/upload",
                         files=files,
-                        data=data
+                        data=data,
+                        headers=auth_headers
                     )
                     
                     if response.status_code == 200:
