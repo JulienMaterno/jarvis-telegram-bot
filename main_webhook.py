@@ -702,64 +702,64 @@ async def process_audio_in_background(
             
             if response.status_code == 200:
                 result = response.json()
+                
+                if result.get("status") == "success":
+                    summary = result.get("summary", "Processed successfully")
+                    details = result.get("details", {})
                     
-                    if result.get("status") == "success":
-                        summary = result.get("summary", "Processed successfully")
-                        details = result.get("details", {})
-                        
-                        # Build success message
-                        message = (
-                            f"✅ *Audio processed!*\n\n"
-                            f"📁 `{filename}`\n\n"
-                            f"{summary}\n\n"
-                            f"📝 Transcript: {details.get('transcript_length', 0)} chars"
-                        )
-                        
-                        # Send completion notification as NEW message
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=message,
-                            parse_mode='Markdown'
-                        )
-                        
-                        # Add to chat history
-                        voice_memo_context = _build_voice_memo_history_entry(
-                            details, summary, result.get("category")
-                        )
-                        _add_to_conversation_history(
-                            user_id,
-                            "user",
-                            f"[Audio File Processed]\n{voice_memo_context['user_context']}"
-                        )
-                        _add_to_conversation_history(
-                            user_id,
-                            "assistant",
-                            voice_memo_context['assistant_summary']
-                        )
-                        
-                        # Check for contact linking needs
-                        contact_matches = details.get("contact_matches", [])
-                        meeting_ids = details.get("meeting_ids", [])
-                        contact_prompt = build_contact_text_prompt(
-                            contact_matches, meeting_ids, user_id
-                        )
-                        if contact_prompt:
-                            await bot.send_message(chat_id=chat_id, text=contact_prompt)
-                        
-                        logger.info(f"Background processing completed: {filename}")
-                    else:
-                        error = result.get("error", "Unknown error")
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=f"⚠️ Processing completed with issues:\n{error}"
-                        )
-                        logger.warning(f"Pipeline returned error for {filename}: {error}")
-                else:
+                    # Build success message
+                    message = (
+                        f"✅ *Audio processed!*\n\n"
+                        f"📁 `{filename}`\n\n"
+                        f"{summary}\n\n"
+                        f"📝 Transcript: {details.get('transcript_length', 0)} chars"
+                    )
+                    
+                    # Send completion notification as NEW message
                     await bot.send_message(
                         chat_id=chat_id,
-                        text=f"❌ Audio pipeline error: HTTP {response.status_code}"
+                        text=message,
+                        parse_mode='Markdown'
                     )
-                    logger.error(f"Pipeline returned {response.status_code} for {filename}")
+                    
+                    # Add to chat history
+                    voice_memo_context = _build_voice_memo_history_entry(
+                        details, summary, result.get("category")
+                    )
+                    _add_to_conversation_history(
+                        user_id,
+                        "user",
+                        f"[Audio File Processed]\n{voice_memo_context['user_context']}"
+                    )
+                    _add_to_conversation_history(
+                        user_id,
+                        "assistant",
+                        voice_memo_context['assistant_summary']
+                    )
+                    
+                    # Check for contact linking needs
+                    contact_matches = details.get("contact_matches", [])
+                    meeting_ids = details.get("meeting_ids", [])
+                    contact_prompt = build_contact_text_prompt(
+                        contact_matches, meeting_ids, user_id
+                    )
+                    if contact_prompt:
+                        await bot.send_message(chat_id=chat_id, text=contact_prompt)
+                    
+                    logger.info(f"Background processing completed: {filename}")
+                else:
+                    error = result.get("error", "Unknown error")
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"⚠️ Processing completed with issues:\n{error}"
+                    )
+                    logger.warning(f"Pipeline returned error for {filename}: {error}")
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Audio pipeline error: HTTP {response.status_code}"
+                )
+                logger.error(f"Pipeline returned {response.status_code} for {filename}")
                 
     except asyncio.TimeoutError:
         await bot.send_message(
