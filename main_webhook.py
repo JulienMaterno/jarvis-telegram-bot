@@ -502,11 +502,10 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 reason = result.get('reason', 'unknown')
                 last_start = result.get('last_sync_start', '')
                 await status_msg.edit_text(
-                    f"⏳ *Sync Skipped*\n\n"
+                    f"⏳ Sync Skipped\n\n"
                     f"Reason: {reason}\n"
-                    f"Last sync started: `{last_start}`\n\n"
-                    f"_Try again in a minute._",
-                    parse_mode='Markdown'
+                    f"Last sync started: {last_start}\n\n"
+                    f"Try again in a minute."
                 )
                 return
             
@@ -517,8 +516,8 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             duration = summary.get('duration_seconds', 0)
             results = result.get('results', {})
             
-            # Build detailed report
-            report_lines = [f"✅ *Sync Complete*\n"]
+            # Build detailed report (without markdown that could fail)
+            report_lines = ["✅ Sync Complete\n"]
             report_lines.append(f"⏱️ Duration: {duration:.1f}s")
             report_lines.append(f"✅ Success: {success_count} | ❌ Errors: {error_count}\n")
             
@@ -539,40 +538,70 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         status_icon = "✅" if r.get('status') == 'success' else "❌"
                         # Get sync stats if available
                         data = r.get('data', {})
+                        display_name = key.replace('_sync', '').replace('_', ' ').title()
+                        
                         if isinstance(data, dict):
-                            created = data.get('created', 0) or data.get('events_created', 0) or data.get('new_contacts', 0)
-                            updated = data.get('updated', 0) or data.get('events_updated', 0) or data.get('updated_contacts', 0)
-                            if created or updated:
-                                category_results.append(f"  {status_icon} {key.replace('_sync', '').replace('_', ' ').title()}: +{created} / ~{updated}")
+                            # Try multiple possible field names for created/updated counts
+                            created = (
+                                data.get('created', 0) or 
+                                data.get('events_created', 0) or 
+                                data.get('new_contacts', 0) or
+                                data.get('notion_created', 0) or
+                                data.get('supabase_created', 0) or
+                                0
+                            )
+                            updated = (
+                                data.get('updated', 0) or 
+                                data.get('events_updated', 0) or 
+                                data.get('updated_contacts', 0) or
+                                data.get('notion_updated', 0) or
+                                data.get('supabase_updated', 0) or
+                                0
+                            )
+                            deleted = data.get('deleted', 0) or data.get('notion_deleted', 0) or 0
+                            
+                            # Build stats string
+                            stats_parts = []
+                            if created:
+                                stats_parts.append(f"+{created}")
+                            if updated:
+                                stats_parts.append(f"~{updated}")
+                            if deleted:
+                                stats_parts.append(f"-{deleted}")
+                            
+                            if stats_parts:
+                                category_results.append(f"  {status_icon} {display_name}: {' / '.join(stats_parts)}")
                             else:
-                                category_results.append(f"  {status_icon} {key.replace('_sync', '').replace('_', ' ').title()}")
+                                category_results.append(f"  {status_icon} {display_name}")
                         elif r.get('status') == 'error':
-                            err = r.get('error', 'Unknown')[:30]
-                            category_results.append(f"  {status_icon} {key.replace('_sync', '').replace('_', ' ').title()}: {err}")
+                            # Sanitize error message - remove special chars that break markdown
+                            err = str(r.get('error', 'Unknown'))[:40]
+                            err = err.replace('*', '').replace('_', '').replace('`', '').replace('[', '').replace(']', '')
+                            category_results.append(f"  {status_icon} {display_name}: {err}")
                         else:
-                            category_results.append(f"  {status_icon} {key.replace('_sync', '').replace('_', ' ').title()}")
+                            category_results.append(f"  {status_icon} {display_name}")
                 
                 if category_results:
-                    report_lines.append(f"*{category_name}*")
+                    report_lines.append(category_name)
                     report_lines.extend(category_results)
                     report_lines.append("")  # Empty line between categories
             
-            # Join and send report
+            # Join and send report (no markdown to avoid parsing issues)
             report = "\n".join(report_lines)
             
             # Telegram message limit is 4096 chars
             if len(report) > 4000:
-                report = report[:3950] + "\n\n_...truncated_"
+                report = report[:3950] + "\n\n...truncated"
             
-            await status_msg.edit_text(report, parse_mode='Markdown')
+            # Send without markdown to avoid parsing errors
+            await status_msg.edit_text(report)
             
     except httpx.TimeoutException:
         await status_msg.edit_text(
-            "⏱️ *Sync Timeout*\n\n"
+            "⏱️ Sync Timeout\n\n"
             "The sync is taking longer than expected.\n"
             "It's still running in the background.\n\n"
-            "_Check again in a few minutes._",
-            parse_mode='Markdown'
+            "Check again in a few minutes."
         )
     except Exception as e:
         logger.error(f"Sync command error: {e}", exc_info=True)
