@@ -40,6 +40,7 @@ GOOGLE_DRIVE_FOLDER_ID = os.getenv('GOOGLE_DRIVE_FOLDER_ID', '').strip()
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # e.g., https://your-bot.run.app
 AUDIO_PIPELINE_URL = os.getenv('AUDIO_PIPELINE_URL', '').strip()  # e.g., https://jarvis-audio-pipeline-xxx.run.app
 INTELLIGENCE_SERVICE_URL = os.getenv('INTELLIGENCE_SERVICE_URL', '').strip()  # For contact operations
+SYNC_SERVICE_URL = os.getenv('SYNC_SERVICE_URL', '').strip()  # For triggering syncs
 ALLOWED_USER_IDS = [int(id.strip()) for id in os.getenv('ALLOWED_USER_IDS', '').split(',') if id.strip()]
 
 # Global bot application
@@ -311,6 +312,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• Create: _'Add task: call dentist'_\n"
         "• Query: _'What meetings this week?'_\n\n"
         "*Commands:*\n"
+        "/process - Check & process Google Drive audios\n"
+        "/sync - Trigger full data sync\n"
         "/help - Show this message\n"
         "/cancel - Cancel current operation",
         parse_mode='Markdown'
@@ -325,6 +328,255 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("❌ Contact creation cancelled.")
     else:
         await update.message.reply_text("Nothing to cancel.")
+
+
+# =========================================================================
+# PROCESS AUDIOS COMMAND - Trigger Google Drive audio processing
+# =========================================================================
+
+async def process_audios_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Check Google Drive for audio files and trigger processing.
+    Usage: /process or /audios
+    """
+    user = update.effective_user
+    
+    if not is_authorized(user.id):
+        await update.message.reply_text("❌ You are not authorized to use this bot.")
+        return
+    
+    if not AUDIO_PIPELINE_URL:
+        await update.message.reply_text("❌ Audio pipeline not configured.")
+        return
+    
+    # Send initial status
+    status_msg = await update.message.reply_text("🔍 Checking Google Drive for audio files...")
+    
+    try:
+        auth_headers = get_auth_headers(AUDIO_PIPELINE_URL)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # First, check what files are in the inbox
+            files_response = await client.get(
+                f"{AUDIO_PIPELINE_URL}/files",
+                headers=auth_headers
+            )
+            
+            if files_response.status_code != 200:
+                await status_msg.edit_text(f"❌ Failed to check files: HTTP {files_response.status_code}")
+                return
+            
+            files_data = files_response.json()
+            files = files_data.get('files', [])
+            count = files_data.get('count', 0)
+            
+            if count == 0:
+                await status_msg.edit_text(
+                    "📂 *Google Drive Inbox*\n\n"
+                    "No audio files found.\n\n"
+                    "_Files are automatically processed when you upload to the Audio Files folder._",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Show files found
+            file_list = "\n".join([f"• `{f['name']}`" for f in files[:10]])
+            if count > 10:
+                file_list += f"\n_...and {count - 10} more_"
+            
+            await status_msg.edit_text(
+                f"📂 *Google Drive Inbox*\n\n"
+                f"Found {count} audio file(s):\n{file_list}\n\n"
+                f"⏳ Starting processing...",
+                parse_mode='Markdown'
+            )
+            
+            # Check current status (is something already processing?)
+            queue_response = await client.get(
+                f"{AUDIO_PIPELINE_URL}/queue",
+                headers=auth_headers
+            )
+            
+            if queue_response.status_code == 200:
+                queue_data = queue_response.json()
+                if queue_data.get('status') == 'processing':
+                    current = queue_data.get('current_file', 'unknown file')
+                    elapsed = queue_data.get('elapsed_display', 'unknown')
+                    await status_msg.edit_text(
+                        f"📂 *Google Drive Inbox*\n\n"
+                        f"Found {count} audio file(s):\n{file_list}\n\n"
+                        f"⏳ Already processing: `{current}`\n"
+                        f"Time elapsed: {elapsed}\n\n"
+                        f"_New files will be queued automatically._",
+                        parse_mode='Markdown'
+                    )
+                    return
+            
+            # Trigger processing in background mode
+            process_response = await client.post(
+                f"{AUDIO_PIPELINE_URL}/process",
+                params={"background": "true"},
+                headers=auth_headers
+            )
+            
+            if process_response.status_code == 200:
+                result = process_response.json()
+                status = result.get('status', 'unknown')
+                
+                if status == 'accepted':
+                    await status_msg.edit_text(
+                        f"📂 *Google Drive Inbox*\n\n"
+                        f"Found {count} audio file(s):\n{file_list}\n\n"
+                        f"✅ Processing started!\n\n"
+                        f"_You'll receive notifications as each file is processed._",
+                        parse_mode='Markdown'
+                    )
+                elif status == 'already_processing':
+                    await status_msg.edit_text(
+                        f"📂 *Google Drive Inbox*\n\n"
+                        f"Found {count} audio file(s):\n{file_list}\n\n"
+                        f"⏳ Processing already in progress.\n"
+                        f"_Files will be processed in queue._",
+                        parse_mode='Markdown'
+                    )
+                else:
+                    await status_msg.edit_text(
+                        f"📂 *Google Drive Inbox*\n\n"
+                        f"Found {count} file(s):\n{file_list}\n\n"
+                        f"Status: {status}",
+                        parse_mode='Markdown'
+                    )
+            else:
+                await status_msg.edit_text(
+                    f"❌ Failed to start processing: HTTP {process_response.status_code}"
+                )
+                
+    except httpx.TimeoutException:
+        await status_msg.edit_text("⏱️ Timeout checking audio pipeline. Try again later.")
+    except Exception as e:
+        logger.error(f"Process audios error: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Error: {str(e)}")
+
+
+# =========================================================================
+# SYNC COMMAND - Trigger Sync Service and show results
+# =========================================================================
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Trigger the sync service and show progress/results.
+    Usage: /sync
+    """
+    user = update.effective_user
+    
+    if not is_authorized(user.id):
+        await update.message.reply_text("❌ You are not authorized to use this bot.")
+        return
+    
+    if not SYNC_SERVICE_URL:
+        await update.message.reply_text("❌ Sync service not configured.")
+        return
+    
+    # Send initial status
+    status_msg = await update.message.reply_text("🔄 Triggering sync service...")
+    
+    try:
+        auth_headers = get_auth_headers(SYNC_SERVICE_URL)
+        
+        # Use a long timeout - full sync can take 2-3 minutes
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            # Call /sync/all endpoint
+            response = await client.post(
+                f"{SYNC_SERVICE_URL}/sync/all",
+                headers=auth_headers
+            )
+            
+            if response.status_code != 200:
+                error_detail = response.text[:200] if response.text else "Unknown error"
+                await status_msg.edit_text(f"❌ Sync failed: HTTP {response.status_code}\n{error_detail}")
+                return
+            
+            result = response.json()
+            status = result.get('status', 'unknown')
+            
+            if status == 'skipped':
+                reason = result.get('reason', 'unknown')
+                last_start = result.get('last_sync_start', '')
+                await status_msg.edit_text(
+                    f"⏳ *Sync Skipped*\n\n"
+                    f"Reason: {reason}\n"
+                    f"Last sync started: `{last_start}`\n\n"
+                    f"_Try again in a minute._",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Parse results
+            summary = result.get('summary', {})
+            success_count = summary.get('success_count', 0)
+            error_count = summary.get('error_count', 0)
+            duration = summary.get('duration_seconds', 0)
+            results = result.get('results', {})
+            
+            # Build detailed report
+            report_lines = [f"✅ *Sync Complete*\n"]
+            report_lines.append(f"⏱️ Duration: {duration:.1f}s")
+            report_lines.append(f"✅ Success: {success_count} | ❌ Errors: {error_count}\n")
+            
+            # Categorize syncs
+            sync_categories = {
+                "📇 Contacts": ["notion_to_supabase", "google_sync", "supabase_to_notion"],
+                "📅 Calendar & Email": ["calendar_sync", "gmail_sync"],
+                "📝 Knowledge": ["meetings_sync", "tasks_sync", "reflections_sync", "journals_sync"],
+                "📚 Reading": ["books_sync", "highlights_sync"],
+                "💬 Messaging": ["beeper_sync"]
+            }
+            
+            for category_name, sync_keys in sync_categories.items():
+                category_results = []
+                for key in sync_keys:
+                    if key in results:
+                        r = results[key]
+                        status_icon = "✅" if r.get('status') == 'success' else "❌"
+                        # Get sync stats if available
+                        data = r.get('data', {})
+                        if isinstance(data, dict):
+                            created = data.get('created', 0) or data.get('events_created', 0) or data.get('new_contacts', 0)
+                            updated = data.get('updated', 0) or data.get('events_updated', 0) or data.get('updated_contacts', 0)
+                            if created or updated:
+                                category_results.append(f"  {status_icon} {key.replace('_sync', '').replace('_', ' ').title()}: +{created} / ~{updated}")
+                            else:
+                                category_results.append(f"  {status_icon} {key.replace('_sync', '').replace('_', ' ').title()}")
+                        elif r.get('status') == 'error':
+                            err = r.get('error', 'Unknown')[:30]
+                            category_results.append(f"  {status_icon} {key.replace('_sync', '').replace('_', ' ').title()}: {err}")
+                        else:
+                            category_results.append(f"  {status_icon} {key.replace('_sync', '').replace('_', ' ').title()}")
+                
+                if category_results:
+                    report_lines.append(f"*{category_name}*")
+                    report_lines.extend(category_results)
+                    report_lines.append("")  # Empty line between categories
+            
+            # Join and send report
+            report = "\n".join(report_lines)
+            
+            # Telegram message limit is 4096 chars
+            if len(report) > 4000:
+                report = report[:3950] + "\n\n_...truncated_"
+            
+            await status_msg.edit_text(report, parse_mode='Markdown')
+            
+    except httpx.TimeoutException:
+        await status_msg.edit_text(
+            "⏱️ *Sync Timeout*\n\n"
+            "The sync is taking longer than expected.\n"
+            "It's still running in the background.\n\n"
+            "_Check again in a few minutes._",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Sync command error: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Error: {str(e)}")
 
 
 def is_authorized(user_id: int) -> bool:
@@ -1496,6 +1748,9 @@ async def lifespan(app: FastAPI):
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("help", help_command))
     bot_app.add_handler(CommandHandler("cancel", cancel_command))
+    bot_app.add_handler(CommandHandler("process", process_audios_command))
+    bot_app.add_handler(CommandHandler("audios", process_audios_command))  # Alias
+    bot_app.add_handler(CommandHandler("sync", sync_command))
     bot_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     bot_app.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     bot_app.add_handler(MessageHandler(filters.LOCATION, handle_location))
