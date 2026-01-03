@@ -464,6 +464,7 @@ async def process_audios_command(update: Update, context: ContextTypes.DEFAULT_T
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Trigger the sync service and show progress/results.
+    If sync is already running, waits and shows results when complete.
     Usage: /sync
     """
     user = update.effective_user
@@ -501,13 +502,59 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if status == 'skipped':
                 reason = result.get('reason', 'unknown')
                 last_start = result.get('last_sync_start', '')
-                await status_msg.edit_text(
-                    f"⏳ Sync Skipped\n\n"
-                    f"Reason: {reason}\n"
-                    f"Last sync started: {last_start}\n\n"
-                    f"Try again in a minute."
-                )
-                return
+                
+                # If skipped because already running, wait for it to complete
+                if reason == 'sync_already_in_progress':
+                    await status_msg.edit_text("⏳ Sync already in progress, waiting for completion...")
+                    
+                    # Poll health endpoint until sync completes (max 5 minutes)
+                    max_wait = 300  # seconds
+                    poll_interval = 10  # seconds
+                    elapsed = 0
+                    
+                    while elapsed < max_wait:
+                        await asyncio.sleep(poll_interval)
+                        elapsed += poll_interval
+                        
+                        try:
+                            health_resp = await client.get(
+                                f"{SYNC_SERVICE_URL}/health",
+                                headers=auth_headers
+                            )
+                            if health_resp.status_code == 200:
+                                health = health_resp.json()
+                                sync_info = health.get('sync', {})
+                                
+                                if not sync_info.get('sync_in_progress'):
+                                    # Sync completed! Get the results
+                                    duration = sync_info.get('last_sync_duration_seconds', 0)
+                                    await status_msg.edit_text(
+                                        f"✅ Sync Complete!\n\n"
+                                        f"⏱️ Duration: {duration:.1f}s\n\n"
+                                        f"Use /sync again to see detailed results."
+                                    )
+                                    return
+                                else:
+                                    # Still running, update message
+                                    await status_msg.edit_text(f"⏳ Sync in progress... ({elapsed}s elapsed)")
+                        except Exception as poll_error:
+                            logger.warning(f"Polling error: {poll_error}")
+                    
+                    # Timeout waiting
+                    await status_msg.edit_text(
+                        "⏱️ Sync is still running\n\n"
+                        "It's taking longer than expected.\n"
+                        "Check back in a few minutes."
+                    )
+                    return
+                else:
+                    await status_msg.edit_text(
+                        f"⏳ Sync Skipped\n\n"
+                        f"Reason: {reason}\n"
+                        f"Last sync started: {last_start}\n\n"
+                        f"Try again in a minute."
+                    )
+                    return
             
             # Parse results
             summary = result.get('summary', {})
