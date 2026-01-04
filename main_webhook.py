@@ -461,6 +461,56 @@ async def process_audios_command(update: Update, context: ContextTypes.DEFAULT_T
 # SYNC COMMAND - Trigger Sync Service and show results
 # =========================================================================
 
+async def _get_inventory_summary(client: httpx.AsyncClient, auth_headers: dict) -> str:
+    """
+    Fetch inventory table from sync service and format for display.
+    Returns formatted string with counts per entity.
+    """
+    try:
+        inv_response = await client.get(
+            f"{SYNC_SERVICE_URL}/inventory/table",
+            headers=auth_headers
+        )
+        if inv_response.status_code == 200:
+            inv_data = inv_response.json()
+            table_rows = inv_data.get('table', [])
+            
+            lines = ["\n📊 Database Inventory:"]
+            for row in table_rows:
+                entity = row.get('entity', '')
+                if entity == 'TOTAL':
+                    continue  # Skip total row, we'll add our own summary
+                    
+                sb = row.get('supabase', 0)
+                n = row.get('notion', 0)
+                g = row.get('google')
+                status = row.get('status', '')
+                diff = row.get('difference', 0)
+                
+                # Format: "📝 Meetings: Notion 13 | Supabase 13 ✅"
+                line = f"  {entity}: Notion {n} | Supabase {sb}"
+                if g is not None:
+                    line += f" | Google {g}"
+                if diff != 0:
+                    line += f" (Δ{diff:+d})"
+                line += f" {status}"
+                lines.append(line)
+            
+            # Add summary
+            summary = inv_data.get('summary', {})
+            all_synced = summary.get('all_synced', False)
+            if all_synced:
+                lines.append("\n✅ All databases in sync!")
+            else:
+                total_diff = summary.get('difference', 0)
+                lines.append(f"\n⚠️ Total difference: {total_diff:+d} records")
+            
+            return "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"Failed to fetch inventory: {e}")
+    return ""
+
+
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Trigger the sync service and show progress/results.
@@ -526,12 +576,13 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                                 sync_info = health.get('sync', {})
                                 
                                 if not sync_info.get('sync_in_progress'):
-                                    # Sync completed! Get the results
+                                    # Sync completed! Get the inventory
                                     duration = sync_info.get('last_sync_duration_seconds', 0)
+                                    inventory_text = await _get_inventory_summary(client, auth_headers)
                                     await status_msg.edit_text(
                                         f"✅ Sync Complete!\n\n"
-                                        f"⏱️ Duration: {duration:.1f}s\n\n"
-                                        f"Use /sync again to see detailed results."
+                                        f"⏱️ Duration: {duration:.1f}s"
+                                        f"{inventory_text}"
                                     )
                                     return
                                 else:
@@ -632,6 +683,11 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     report_lines.append(category_name)
                     report_lines.extend(category_results)
                     report_lines.append("")  # Empty line between categories
+            
+            # Get inventory summary
+            inventory_text = await _get_inventory_summary(client, auth_headers)
+            if inventory_text:
+                report_lines.append(inventory_text)
             
             # Join and send report (no markdown to avoid parsing issues)
             report = "\n".join(report_lines)
